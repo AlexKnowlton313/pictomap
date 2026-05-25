@@ -19,7 +19,8 @@ class AppState {
     this.overlay = null;
   }
 
-  clearContour(): void {
+  /** Drop the traced contour and its placed overlay. Keeps the source image. */
+  clearTrace(): void {
     this.contour = null;
     this.overlay = null;
   }

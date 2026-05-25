@@ -25,8 +25,12 @@ export function thresholdImage(
 }
 
 /**
- * Keep only the largest 4-connected foreground component. Drops noise / stray
+ * Keep only the largest 8-connected foreground component. Drops noise / stray
  * marks so the boundary trace finds the silhouette, not a speck of dust.
+ *
+ * 8-conn matches the connectivity used by traceBoundary — otherwise a
+ * diagonal-only "bridge" pixel could survive tracing while being filtered out
+ * as a separate component here.
  */
 export function keepLargestComponent(
   mask: Uint8Array,
@@ -51,34 +55,24 @@ export function keepLargestComponent(
         count++;
         const px = p % width;
         const py = (p - px) / width;
-        if (px > 0) {
-          const q = p - 1;
+        const xMin = px > 0;
+        const xMax = px < width - 1;
+        const yMin = py > 0;
+        const yMax = py < height - 1;
+        const tryPush = (q: number): void => {
           if (mask[q] === 1 && labels[q] === 0) {
             labels[q] = nextLabel;
             stack.push(q);
           }
-        }
-        if (px < width - 1) {
-          const q = p + 1;
-          if (mask[q] === 1 && labels[q] === 0) {
-            labels[q] = nextLabel;
-            stack.push(q);
-          }
-        }
-        if (py > 0) {
-          const q = p - width;
-          if (mask[q] === 1 && labels[q] === 0) {
-            labels[q] = nextLabel;
-            stack.push(q);
-          }
-        }
-        if (py < height - 1) {
-          const q = p + width;
-          if (mask[q] === 1 && labels[q] === 0) {
-            labels[q] = nextLabel;
-            stack.push(q);
-          }
-        }
+        };
+        if (xMin) tryPush(p - 1);
+        if (xMax) tryPush(p + 1);
+        if (yMin) tryPush(p - width);
+        if (yMax) tryPush(p + width);
+        if (xMin && yMin) tryPush(p - width - 1);
+        if (xMax && yMin) tryPush(p - width + 1);
+        if (xMin && yMax) tryPush(p + width - 1);
+        if (xMax && yMax) tryPush(p + width + 1);
       }
       counts.push(count);
       nextLabel++;

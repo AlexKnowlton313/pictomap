@@ -23,16 +23,24 @@
   let canvas: HTMLCanvasElement;
   let overlay: HTMLCanvasElement;
 
-  // Re-trace whenever sourceData / threshold / invert changes — pure, fast (<10ms for 1MP).
+  // Debounce the trace pass — at the 2000px image cap the whole pipeline can
+  // run ~40ms on the UI thread, which would stutter the slider. Coalescing
+  // ticks keeps drags smooth without needing a worker round-trip yet.
   $effect(() => {
-    try {
-      const r = extractContour(sourceData, { threshold, invert });
-      result = r;
-      traceError = r ? null : 'No contour found at this threshold';
-    } catch (err) {
-      traceError = err instanceof Error ? err.message : 'Tracing failed';
-      result = null;
-    }
+    const src = sourceData;
+    const t = threshold;
+    const i = invert;
+    const id = setTimeout(() => {
+      try {
+        const r = extractContour(src, { threshold: t, invert: i });
+        result = r;
+        traceError = r ? null : 'No contour found at this threshold';
+      } catch (err) {
+        traceError = err instanceof Error ? err.message : 'Tracing failed';
+        result = null;
+      }
+    }, 60);
+    return () => clearTimeout(id);
   });
 
   // Paint the source image onto the base canvas (only when image changes).

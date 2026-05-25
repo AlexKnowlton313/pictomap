@@ -12,6 +12,7 @@
     contour: Point[];
     overlay: OverlayState;
     onchange: (next: OverlayState) => void;
+    /** Fires once on drag end. Reserved for the debounced matcher re-run (Task 6d). */
     onchangeend?: () => void;
   }
 
@@ -71,12 +72,9 @@
     map.off('resize', reproject);
   });
 
-  // Re-project whenever overlay state changes.
+  // Re-project whenever overlay state changes. reproject() reads every field,
+  // so Svelte's tracker registers all dependencies through that call.
   $effect(() => {
-    overlay.anchor.lng;
-    overlay.anchor.lat;
-    overlay.rotationDeg;
-    overlay.metersPerPixel;
     reproject();
   });
 
@@ -134,6 +132,9 @@
     const { projection: p0, state: s0 } = drag;
 
     if (drag.mode === 'translate') {
+      // Uses px/meter captured at drag start. Pointer capture suppresses
+      // most concurrent zoom input, but a trackpad pinch mid-drag would
+      // make the cursor drift off the image until pointerup.
       const dx = e.clientX - drag.mouse.x;
       const dy = e.clientY - drag.mouse.y;
       if (p0.pxPerMeter === 0) return;

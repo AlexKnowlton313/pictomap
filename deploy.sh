@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-yarn build
+npm run build
 
 aws s3 sync dist/ s3://alex-knowlton/pictomap/ --delete
 

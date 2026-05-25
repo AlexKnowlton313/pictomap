@@ -54,7 +54,7 @@
         <span class="muted">· {(perimeterKm * 0.621371).toFixed(2)} mi</span>
       </span>
       <div class="actions">
-        <button onclick={() => state.clearContour()}>Re-trace</button>
+        <button onclick={() => state.clearTrace()}>Re-trace</button>
         <button onclick={() => state.reset()}>New image</button>
       </div>
     </div>

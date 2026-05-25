@@ -15,6 +15,7 @@
 
   let container: HTMLDivElement;
   let map: maplibregl.Map | null = null;
+  let userMarker: maplibregl.Marker | null = null;
   let userLocation = $state<LngLat | null>(null);
   let locating = $state(false);
   let geoError = $state<string | null>(null);
@@ -22,12 +23,24 @@
 
   const pmtilesUrl = import.meta.env.VITE_PMTILES_URL;
 
+  function showUserMarker(pos: LngLat): void {
+    if (!map) return;
+    if (!userMarker) {
+      const el = document.createElement('div');
+      el.className = 'user-marker';
+      userMarker = new maplibregl.Marker({ element: el }).setLngLat([pos.lng, pos.lat]).addTo(map);
+    } else {
+      userMarker.setLngLat([pos.lng, pos.lat]);
+    }
+  }
+
   async function locate(): Promise<void> {
     locating = true;
     geoError = null;
     try {
       const pos = await getCurrentPosition();
       userLocation = pos;
+      showUserMarker(pos);
       map?.flyTo({ center: [pos.lng, pos.lat], zoom: LOCATED_ZOOM, essential: true });
     } catch (err) {
       const code = (err as GeolocationPositionError | undefined)?.code;
@@ -68,6 +81,8 @@
 
   onDestroy(() => {
     mapStore.instance = null;
+    userMarker?.remove();
+    userMarker = null;
     map?.remove();
     map = null;
   });
@@ -151,5 +166,14 @@
     background: rgba(255, 255, 255, 0.06);
     padding: 1px 6px;
     border-radius: 4px;
+  }
+
+  :global(.user-marker) {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #3b82f6;
+    border: 2.5px solid #fff;
+    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.25), 0 2px 6px rgba(0, 0, 0, 0.4);
   }
 </style>

@@ -1,0 +1,28 @@
+{
+  "name": "pictomap",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@protomaps/basemaps": "^5.7.2",
+    "@sentry/svelte": "^10.53.1",
+    "maplibre-gl": "^5.24.0",
+    "pmtiles": "^4.4.1",
+    "simplify-js": "^1.2.4"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.1.1",
+    "@tsconfig/svelte": "^5.0.8",
+    "svelte": "^5.55.9",
+    "svelte-check": "^4.4.8",
+    "typescript": "^6.0.3",
+    "vite": "^6.4.2",
+    "vite-plugin-mkcert": "^2.0.0"
+  }
+}

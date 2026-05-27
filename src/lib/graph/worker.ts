@@ -1,0 +1,381 @@
+/// <reference lib="webworker" />
+
+import { PMTiles } from 'pmtiles';
+import { VectorTile } from '@mapbox/vector-tile';
+import Pbf from 'pbf';
+import { classifyRoad, isRunnable } from './highway';
+import { Matcher } from './matcher';
+import { TileCache } from './tile-cache';
+import {
+  GRAPH_ZOOM,
+  polylineLength,
+  tilesCoveringBBox,
+} from './tile-math';
+import type {
+  BBox,
+  GraphEdge,
+  GraphNode,
+  RoadClass,
+  RoadGraph,
+  WorkerRequest,
+  WorkerResponse,
+} from './types';
+
+/**
+ * Road graph builder worker.
+ *
+ * Lifecycle:
+ *   1. `init` — receive PMTiles URL, instantiate PMTiles client.
+ *   2. `buildGraph` — fetch all z14 tiles covering bbox, decode MVT,
+ *      classify the `roads` layer, stitch endpoints into nodes, reply
+ *      with a flat RoadGraph.
+ */
+
+let pmtiles: PMTiles | null = null;
+let tileCache: TileCache | null = null;
+let matcher: Matcher | null = null;
+
+const ctx = self as unknown as DedicatedWorkerGlobalScope;
+
+ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
+  const req = e.data;
+  try {
+    if (req.type === 'init') {
+      pmtiles = new PMTiles(req.pmtilesUrl);
+      tileCache = new TileCache(req.pmtilesUrl);
+      // Fire-and-forget: drop entries from older PMTiles URLs so the
+      // cache doesn't grow unbounded as the daily build rotates.
+      tileCache.evictOtherPrefixes();
+      reply({ type: 'ready', reqId: req.reqId });
+      return;
+    }
+
+    if (req.type === 'buildGraph') {
+      if (!pmtiles) throw new Error('Worker not initialized — send `init` first');
+      const graph = await buildGraph(pmtiles, req.bbox);
+      // Keep the latest graph live so the matcher can query it without
+      // re-shipping ~20k edges from the main thread on every snap.
+      matcher = new Matcher(graph);
+      reply({ type: 'graph', reqId: req.reqId, graph });
+      return;
+    }
+
+    if (req.type === 'match') {
+      if (!matcher) throw new Error('No graph built yet — call `buildGraph` first');
+      const result = matcher.match(req.contour);
+      reply({ type: 'match', reqId: req.reqId, result });
+      return;
+    }
+  } catch (err) {
+    reply({
+      type: 'error',
+      reqId: req.reqId,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+};
+
+function reply(res: WorkerResponse): void {
+  ctx.postMessage(res);
+}
+
+// --- Graph build ---------------------------------------------------------
+
+interface RawSegment {
+  coords: [number, number][];
+  klass: RoadClass;
+}
+
+/** Components with fewer edges than this get dropped at graph build. */
+const MIN_COMPONENT_EDGES = 20;
+
+async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
+  const t0 = performance.now();
+  const range = tilesCoveringBBox(bbox, GRAPH_ZOOM);
+  const segments: RawSegment[] = [];
+  const stats = { hits: 0, misses: 0 };
+
+  const tileFetches: Promise<RawSegment[]>[] = [];
+  for (let x = range.minX; x <= range.maxX; x++) {
+    for (let y = range.minY; y <= range.maxY; y++) {
+      tileFetches.push(fetchTileRoads(p, range.z, x, y, tileCache, stats));
+    }
+  }
+  const tileResults = await Promise.all(tileFetches);
+  for (const segs of tileResults) segments.push(...segs);
+
+  console.log(
+    `[graph] tile cache: ${stats.hits} hits / ${stats.misses} misses in ${tileFetches.length} tiles`,
+  );
+
+  const stitched = stitch(segments);
+  const pruned = pruneSmallComponents(stitched, MIN_COMPONENT_EDGES);
+
+  return {
+    nodes: pruned.nodes,
+    edges: pruned.edges,
+    bbox,
+    buildMs: Math.round(performance.now() - t0),
+    tileCount: tileFetches.length,
+  };
+}
+
+async function fetchTileRoads(
+  p: PMTiles,
+  z: number,
+  x: number,
+  y: number,
+  cache: TileCache | null,
+  stats: { hits: number; misses: number },
+): Promise<RawSegment[]> {
+  if (cache) {
+    const cached = await cache.get(z, x, y);
+    if (cached) {
+      stats.hits++;
+      return cached;
+    }
+  }
+  stats.misses++;
+
+  const res = await p.getZxy(z, x, y);
+  if (!res) {
+    // Cache the empty result too — saves a 404 round-trip next time.
+    if (cache) void cache.put(z, x, y, []);
+    return [];
+  }
+
+  const tile = new VectorTile(new Pbf(new Uint8Array(res.data)));
+  const layer = tile.layers.roads;
+  if (!layer) {
+    if (cache) void cache.put(z, x, y, []);
+    return [];
+  }
+
+  const segs: RawSegment[] = [];
+  for (let i = 0; i < layer.length; i++) {
+    const feature = layer.feature(i);
+    // LineString = 2; ignore points/polygons.
+    if (feature.type !== 2) continue;
+
+    const klass = classifyRoad(feature.properties);
+    if (!isRunnable(klass)) continue;
+
+    // toGeoJSON projects tile-local coords -> lng/lat. The Feature's
+    // geometry may be a single LineString or a MultiLineString.
+    const gj = feature.toGeoJSON(x, y, z);
+    const geom = gj.geometry;
+    if (geom.type === 'LineString') {
+      segs.push({ coords: geom.coordinates as [number, number][], klass });
+    } else if (geom.type === 'MultiLineString') {
+      for (const line of geom.coordinates) {
+        segs.push({ coords: line as [number, number][], klass });
+      }
+    }
+  }
+
+  if (cache) void cache.put(z, x, y, segs);
+  return segs;
+}
+
+// --- Stitching -----------------------------------------------------------
+
+/**
+ * Build node + edge lists from raw per-tile linestrings.
+ *
+ * Three passes:
+ *   1. Snap every vertex to a canonical node within ε ≈ 2 m, using a
+ *      grid index. ε absorbs OSM's habit of mapping sidewalks and
+ *      crosswalks with endpoints offset a meter or two from the curb,
+ *      plus any float-projection jitter at tile boundaries.
+ *   2. Count how many linestring vertices land on each canonical node.
+ *   3. Walk each linestring and break off an edge whenever we hit a
+ *      shared canonical node (count ≥ 2) or the linestring's endpoint.
+ *      Without step 3, a long road through a city would be one edge
+ *      with cross-streets meeting its interior vertices — leaving the
+ *      cross-streets disconnected from it in the graph.
+ */
+function stitch(segments: RawSegment[]): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  if (segments.length === 0) return { nodes: [], edges: [] };
+
+  // Pick a reference latitude for the lng-degrees-per-meter scale. Using
+  // the first vertex is fine — the graph spans only a few km so the cosine
+  // doesn't change meaningfully.
+  const refLat = segments[0].coords[0][1];
+  const EPS_M = 2;
+  const M_PER_DEG_LAT = 111_320;
+  const epsLat = EPS_M / M_PER_DEG_LAT;
+  const epsLng = EPS_M / (M_PER_DEG_LAT * Math.cos((refLat * Math.PI) / 180));
+
+  // Grid cell ≈ ε. To merge across cell boundaries, look up 3×3 cells.
+  const grid = new Map<string, number[]>(); // cellKey → canonical node ids
+  const nodes: GraphNode[] = [];
+
+  // ε² in degree² (mixed-unit ok because both axes are scaled the same way).
+  const eps2 = EPS_M * EPS_M;
+
+  const canonicalId = (lng: number, lat: number): number => {
+    const cx = Math.floor(lng / epsLng);
+    const cy = Math.floor(lat / epsLat);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const k = `${cx + dx},${cy + dy}`;
+        const bucket = grid.get(k);
+        if (!bucket) continue;
+        for (const nodeId of bucket) {
+          const n = nodes[nodeId];
+          const dLngM = (n.lng - lng) / epsLng * EPS_M;
+          const dLatM = (n.lat - lat) / epsLat * EPS_M;
+          if (dLngM * dLngM + dLatM * dLatM <= eps2) return nodeId;
+        }
+      }
+    }
+    const id = nodes.length;
+    nodes.push({ id, lng, lat });
+    const k = `${cx},${cy}`;
+    const bucket = grid.get(k);
+    if (bucket) bucket.push(id);
+    else grid.set(k, [id]);
+    return id;
+  };
+
+  // Pass 1+2: assign every vertex to a canonical node, then count occurrences.
+  const vertNodeIds: number[][] = new Array(segments.length);
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s];
+    const ids = new Array<number>(seg.coords.length);
+    for (let i = 0; i < seg.coords.length; i++) {
+      ids[i] = canonicalId(seg.coords[i][0], seg.coords[i][1]);
+    }
+    vertNodeIds[s] = ids;
+  }
+  const counts = new Int32Array(nodes.length);
+  for (const ids of vertNodeIds) {
+    for (const id of ids) counts[id]++;
+  }
+
+  // Pass 3: split at any canonical node with count ≥ 2 (intersection)
+  // or at linestring endpoints.
+  const edges: GraphEdge[] = [];
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s];
+    const ids = vertNodeIds[s];
+    if (seg.coords.length < 2) continue;
+
+    let chunkStart = ids[0];
+    let chunk: [number, number][] = [seg.coords[0]];
+    for (let i = 1; i < seg.coords.length; i++) {
+      const v = seg.coords[i];
+      chunk.push(v);
+      const isShared = counts[ids[i]] >= 2;
+      const isLast = i === seg.coords.length - 1;
+      if (!(isShared || isLast)) continue;
+
+      const chunkEnd = ids[i];
+      if (chunkStart !== chunkEnd && chunk.length >= 2) {
+        edges.push({
+          id: edges.length,
+          a: chunkStart,
+          b: chunkEnd,
+          coords: chunk,
+          length: polylineLength(chunk),
+          klass: seg.klass,
+        });
+      }
+      chunkStart = chunkEnd;
+      chunk = [v];
+    }
+  }
+  return { nodes, edges };
+}
+
+/**
+ * Drop connected components with fewer edges than `minEdges`. OSM
+ * commonly has isolated parking-lot loops, orphan alley sidewalks, and
+ * single-feature paths that don't touch the main road network — these
+ * become candidates the matcher can never bridge out of (bounded
+ * Dijkstra reaches only ~5 nodes), so the cleanest fix is to exclude
+ * them at build time.
+ *
+ * After pruning, nodes and edges are re-indexed densely starting at 0.
+ */
+function pruneSmallComponents(
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] },
+  minEdges: number,
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  const { nodes, edges } = graph;
+  if (edges.length === 0) return graph;
+
+  const adj: number[][] = Array.from({ length: nodes.length }, () => []);
+  for (let i = 0; i < edges.length; i++) {
+    adj[edges[i].a].push(i);
+    adj[edges[i].b].push(i);
+  }
+
+  // BFS each unvisited edge; tag every edge in the same component.
+  const edgeComp = new Int32Array(edges.length).fill(-1);
+  const compSize: number[] = [];
+  for (let startE = 0; startE < edges.length; startE++) {
+    if (edgeComp[startE] !== -1) continue;
+    const compId = compSize.length;
+    let size = 0;
+    const queue: number[] = [startE];
+    edgeComp[startE] = compId;
+    while (queue.length > 0) {
+      const eId = queue.pop()!;
+      size++;
+      const e = edges[eId];
+      for (const node of [e.a, e.b]) {
+        for (const nbr of adj[node]) {
+          if (edgeComp[nbr] === -1) {
+            edgeComp[nbr] = compId;
+            queue.push(nbr);
+          }
+        }
+      }
+    }
+    compSize.push(size);
+  }
+
+  const oldNodeToNew = new Int32Array(nodes.length).fill(-1);
+  const newNodes: GraphNode[] = [];
+  const newEdges: GraphEdge[] = [];
+  let droppedEdges = 0;
+  let droppedComps = 0;
+  for (let i = 0; i < compSize.length; i++) {
+    if (compSize[i] < minEdges) droppedComps++;
+  }
+  for (let i = 0; i < edges.length; i++) {
+    if (compSize[edgeComp[i]] < minEdges) {
+      droppedEdges++;
+      continue;
+    }
+    const e = edges[i];
+    let a = oldNodeToNew[e.a];
+    if (a < 0) {
+      a = newNodes.length;
+      oldNodeToNew[e.a] = a;
+      newNodes.push({ id: a, lng: nodes[e.a].lng, lat: nodes[e.a].lat });
+    }
+    let b = oldNodeToNew[e.b];
+    if (b < 0) {
+      b = newNodes.length;
+      oldNodeToNew[e.b] = b;
+      newNodes.push({ id: b, lng: nodes[e.b].lng, lat: nodes[e.b].lat });
+    }
+    newEdges.push({
+      id: newEdges.length,
+      a,
+      b,
+      coords: e.coords,
+      length: e.length,
+      klass: e.klass,
+    });
+  }
+
+  const top = [...compSize].sort((a, b) => b - a).slice(0, 5);
+  console.log(
+    `[graph] ${compSize.length} components (top sizes: ${top.join(', ')}); ` +
+    `dropped ${droppedComps} components / ${droppedEdges} edges below ${minEdges}-edge floor`,
+  );
+  return { nodes: newNodes, edges: newEdges };
+}

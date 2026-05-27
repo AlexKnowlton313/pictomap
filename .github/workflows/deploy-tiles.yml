@@ -1,0 +1,83 @@
+# Weekly: extract a zoom-bounded planet PMTiles archive from Protomaps' daily
+# build and upload to S3. Date-versioned object, immutable cache, no CloudFront
+# invalidation needed — switching the app over is a VITE_PMTILES_URL update.
+#
+# One-time AWS setup:
+#   1. Same OIDC provider as deploy.yml.
+#   2. Create an IAM role assumable by repo:AlexKnowlton313/pictomap:* with
+#      s3:PutObject on arn:aws:s3:::alex-knowlton/pictomap/tiles/*.
+#      Store the role ARN as repo secret AWS_TILES_ROLE_ARN.
+#      (Reusing AWS_DEPLOY_ROLE_ARN is fine if you'd rather not split roles.)
+
+name: Deploy tiles
+
+on:
+  schedule:
+    # Mondays at 07:00 UTC. Protomaps builds publish daily ~06:00 UTC, so by
+    # the time this runs "yesterday's" build is reliably available.
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      min_zoom:
+        description: Minimum zoom level
+        required: false
+        default: '10'
+      max_zoom:
+        description: Maximum zoom level
+        required: false
+        default: '14'
+      source_date:
+        description: Source build date YYYYMMDD (blank = yesterday UTC)
+        required: false
+
+concurrency:
+  group: deploy-tiles
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Standard runners ship with ~14GB free of 80GB. The extract for
+      # z10-z14 globally lands in tens of GB, so reclaim space first.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Install pmtiles CLI
+        run: |
+          set -euo pipefail
+          VERSION=1.22.2
+          curl -fsSL -o pmtiles.tar.gz \
+            "https://github.com/protomaps/go-pmtiles/releases/download/v${VERSION}/go-pmtiles_${VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf pmtiles.tar.gz pmtiles
+          sudo mv pmtiles /usr/local/bin/
+          pmtiles version
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Build & upload
+        env:
+          MIN_ZOOM: ${{ inputs.min_zoom || '10' }}
+          MAX_ZOOM: ${{ inputs.max_zoom || '14' }}
+          SOURCE_DATE: ${{ inputs.source_date }}
+        run: |
+          # Empty SOURCE_DATE means "let the script default to yesterday UTC".
+          [ -z "${SOURCE_DATE:-}" ] && unset SOURCE_DATE
+          ./deploy-tiles.sh

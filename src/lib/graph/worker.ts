@@ -248,7 +248,8 @@ function stitch(
   const grid = new Map<string, number[]>(); // cellKey → canonical node ids
   const nodes: GraphNode[] = [];
 
-  // ε² in degree² (mixed-unit ok because both axes are scaled the same way).
+  // ε² in meters² — the distance check below rescales lng/lat back to
+  // meters so the two axes are directly comparable to EPS_M.
   const eps2 = EPS_M * EPS_M;
 
   const canonicalId = (lng: number, lat: number, level: number): number => {
@@ -355,7 +356,8 @@ function pruneSmallComponents(
     adj[edges[i].b].push(i);
   }
 
-  // BFS each unvisited edge; tag every edge in the same component.
+  // DFS each unvisited edge (queue.pop is LIFO); tag every edge in the
+  // same component. Either traversal order would give the same labels.
   const edgeComp = new Int32Array(edges.length).fill(-1);
   const compSize: number[] = [];
   for (let startE = 0; startE < edges.length; startE++) {

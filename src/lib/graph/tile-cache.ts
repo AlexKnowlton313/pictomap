@@ -23,6 +23,8 @@ import type { RoadClass } from './types';
 export interface CachedSegment {
   coords: [number, number][];
   klass: RoadClass;
+  /** OSM-style vertical level (0 = ground, +1 = bridge, −1 = tunnel). */
+  level: number;
 }
 
 const DB_NAME = 'pictomap-graph';

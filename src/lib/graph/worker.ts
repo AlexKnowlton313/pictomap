@@ -84,6 +84,14 @@ function reply(res: WorkerResponse): void {
 interface RawSegment {
   coords: [number, number][];
   klass: RoadClass;
+  /**
+   * Vertical separation level, OSM-style. 0 = ground, +1 = bridge,
+   * −1 = tunnel. Used by `stitch` so that a bridge crossing a street at
+   * the same lng/lat does not get its interior vertices merged with the
+   * street below. Endpoints always merge at level 0 so bridge/tunnel
+   * features stay connected to their approach roads.
+   */
+  level: number;
 }
 
 /** Components with fewer edges than this get dropped at graph build. */
@@ -160,21 +168,42 @@ async function fetchTileRoads(
     const klass = classifyRoad(feature.properties);
     if (!isRunnable(klass)) continue;
 
+    const level = featureLevel(feature.properties);
+
     // toGeoJSON projects tile-local coords -> lng/lat. The Feature's
     // geometry may be a single LineString or a MultiLineString.
     const gj = feature.toGeoJSON(x, y, z);
     const geom = gj.geometry;
     if (geom.type === 'LineString') {
-      segs.push({ coords: geom.coordinates as [number, number][], klass });
+      segs.push({ coords: geom.coordinates as [number, number][], klass, level });
     } else if (geom.type === 'MultiLineString') {
       for (const line of geom.coordinates) {
-        segs.push({ coords: line as [number, number][], klass });
+        segs.push({ coords: line as [number, number][], klass, level });
       }
     }
   }
 
   if (cache) void cache.put(z, x, y, segs);
   return segs;
+}
+
+/**
+ * OSM-style vertical level for a road feature. Reads from `layer`
+ * (numeric) when present; otherwise infers from `is_bridge`/`bridge`
+ * (treated as +1) and `is_tunnel`/`tunnel` (−1). Defaults to 0.
+ *
+ * Protomaps schemas don't all expose these properties, so missing-data
+ * resolves to the ground-level 0 — i.e. the previous behavior.
+ */
+function featureLevel(props: Record<string, string | number | boolean>): number {
+  const raw = props.layer ?? props.level;
+  if (raw !== undefined && raw !== null) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n !== 0) return n;
+  }
+  if (props.is_bridge === true || props.bridge === true || props.bridge === 'yes') return 1;
+  if (props.is_tunnel === true || props.tunnel === true || props.tunnel === 'yes') return -1;
+  return 0;
 }
 
 // --- Stitching -----------------------------------------------------------
@@ -193,6 +222,11 @@ async function fetchTileRoads(
  *      Without step 3, a long road through a city would be one edge
  *      with cross-streets meeting its interior vertices — leaving the
  *      cross-streets disconnected from it in the graph.
+ *
+ * Grade separation: the canonical-id key includes the segment's `level`
+ * (bridge/tunnel) for *interior* vertices only. Endpoints always merge
+ * at level 0 so a bridge feature still connects to its at-grade
+ * approach road at the abutment.
  */
 function stitch(segments: RawSegment[]): { nodes: GraphNode[]; edges: GraphEdge[] } {
   if (segments.length === 0) return { nodes: [], edges: [] };
@@ -207,18 +241,20 @@ function stitch(segments: RawSegment[]): { nodes: GraphNode[]; edges: GraphEdge[
   const epsLng = EPS_M / (M_PER_DEG_LAT * Math.cos((refLat * Math.PI) / 180));
 
   // Grid cell ≈ ε. To merge across cell boundaries, look up 3×3 cells.
+  // Cells are also segregated by `level` so bridge-interior vertices
+  // don't get matched against street-interior vertices below.
   const grid = new Map<string, number[]>(); // cellKey → canonical node ids
   const nodes: GraphNode[] = [];
 
   // ε² in degree² (mixed-unit ok because both axes are scaled the same way).
   const eps2 = EPS_M * EPS_M;
 
-  const canonicalId = (lng: number, lat: number): number => {
+  const canonicalId = (lng: number, lat: number, level: number): number => {
     const cx = Math.floor(lng / epsLng);
     const cy = Math.floor(lat / epsLat);
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
-        const k = `${cx + dx},${cy + dy}`;
+        const k = `${cx + dx},${cy + dy},${level}`;
         const bucket = grid.get(k);
         if (!bucket) continue;
         for (const nodeId of bucket) {
@@ -231,7 +267,7 @@ function stitch(segments: RawSegment[]): { nodes: GraphNode[]; edges: GraphEdge[
     }
     const id = nodes.length;
     nodes.push({ id, lng, lat });
-    const k = `${cx},${cy}`;
+    const k = `${cx},${cy},${level}`;
     const bucket = grid.get(k);
     if (bucket) bucket.push(id);
     else grid.set(k, [id]);
@@ -239,12 +275,18 @@ function stitch(segments: RawSegment[]): { nodes: GraphNode[]; edges: GraphEdge[
   };
 
   // Pass 1+2: assign every vertex to a canonical node, then count occurrences.
+  // Endpoints are placed at level 0 (ground) so they connect to anything
+  // they meet; interior vertices carry their feature's level so bridges
+  // and tunnels stay segregated from the surface network in between.
   const vertNodeIds: number[][] = new Array(segments.length);
   for (let s = 0; s < segments.length; s++) {
     const seg = segments[s];
+    const last = seg.coords.length - 1;
     const ids = new Array<number>(seg.coords.length);
     for (let i = 0; i < seg.coords.length; i++) {
-      ids[i] = canonicalId(seg.coords[i][0], seg.coords[i][1]);
+      const isEndpoint = i === 0 || i === last;
+      const level = isEndpoint ? 0 : seg.level;
+      ids[i] = canonicalId(seg.coords[i][0], seg.coords[i][1], level);
     }
     vertNodeIds[s] = ids;
   }

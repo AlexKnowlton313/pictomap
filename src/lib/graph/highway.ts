@@ -124,8 +124,9 @@ export function isRunnable(klass: RoadClass): boolean {
 }
 
 /**
- * Version of the classification rules. Bumped whenever classifyRoad or
- * isRunnable changes behavior; the tile cache includes this in its key
- * so old entries are ignored after a rule change.
+ * Version of the classification rules / cached-segment schema. Bumped
+ * whenever classifyRoad, isRunnable, or the CachedSegment shape change
+ * in a way that would make older cached entries wrong. The tile cache
+ * includes this in its key, so a bump invalidates stale entries.
  */
-export const CLASSIFIER_VERSION = 2;
+export const CLASSIFIER_VERSION = 3;

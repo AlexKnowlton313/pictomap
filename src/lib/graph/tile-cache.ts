@@ -1,13 +1,19 @@
+import { CLASSIFIER_VERSION } from './highway';
 import type { RoadClass } from './types';
 
 /**
  * IndexedDB cache for decoded per-tile road segments.
  *
- * Keys are `<pmtilesUrl>|<z>/<x>/<y>`. The PMTiles URL embeds a build
- * date (`/pmtiles/<YYYYMMDD>.pmtiles`), so swapping the env var
- * implicitly invalidates the cache — and on init we drop entries whose
- * URL prefix doesn't match the current one (`evictOtherPrefixes`), so
- * the DB doesn't grow without bound as builds rotate.
+ * Keys are `<pmtilesUrl>|c<CLASSIFIER_VERSION>|<z>/<x>/<y>`. Two reasons
+ * the prefix has both parts:
+ *   - The PMTiles URL embeds a build date, so swapping the env var
+ *     invalidates the cache when underlying OSM data rotates.
+ *   - CLASSIFIER_VERSION invalidates when our classification rules
+ *     change — cached entries store post-classification segments, so a
+ *     classifier change without this would silently serve stale labels.
+ *
+ * On init we drop entries whose prefix doesn't match the current one
+ * (`evictOtherPrefixes`), so the DB doesn't grow without bound.
  *
  * All ops fail silently (return null / no-op) if IndexedDB is
  * unavailable — private-browsing Safari, quota errors, etc. — so the
@@ -28,7 +34,7 @@ export class TileCache {
   private prefix: string;
 
   constructor(pmtilesUrl: string) {
-    this.prefix = pmtilesUrl;
+    this.prefix = `${pmtilesUrl}|c${CLASSIFIER_VERSION}`;
     this.dbP = this.openDb();
   }
 

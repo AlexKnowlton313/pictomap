@@ -42,7 +42,11 @@ const TRANSITION_CAP_MULTIPLIER = 5;
 const TRANSITION_CAP_FLOOR_M = 400;
 
 const RUNNABILITY_PENALTY: Record<RoadClass, number> = {
-  motorway: Number.POSITIVE_INFINITY, // already filtered, defensive
+  // The three hard-blocked classes below are filtered out at graph build
+  // time and should never reach the matcher; the +∞ here is defensive.
+  motorway: Number.POSITIVE_INFINITY,
+  rail: Number.POSITIVE_INFINITY,
+  unbuilt: Number.POSITIVE_INFINITY,
   major: 0.6,
   minor: 0.15,
   residential: 0,

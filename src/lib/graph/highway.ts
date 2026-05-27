@@ -6,8 +6,12 @@ import type { RoadClass } from './types';
  *
  * The Protomaps schema uses `kind` for the coarse bucket and `kind_detail`
  * for the OSM `highway=` value. We key off `kind_detail` when available
- * because it preserves runnability-relevant distinctions (motorway vs trunk,
- * footway vs service).
+ * because it preserves runnability-relevant distinctions.
+ *
+ * Runner-safety rules (hard-blocked at the graph level):
+ *   - motorways and trunks: high-speed, often no shoulder or sidewalk
+ *   - rail / transit / aerialway / ferry: not roads
+ *   - construction / proposed / abandoned: not actually walkable
  */
 export function classifyRoad(
   props: Record<string, string | number | boolean>,
@@ -15,12 +19,57 @@ export function classifyRoad(
   const detail = String(props.kind_detail ?? '');
   const kind = String(props.kind ?? '');
 
+  // Rail / transit / aerialway / ferry. The default Protomaps `roads`
+  // layer usually excludes these, but the schema is the author's choice
+  // and some builds include rail. Hard-block defensively.
+  if (
+    kind === 'rail' ||
+    kind === 'aerialway' ||
+    kind === 'ferry' ||
+    kind === 'transit' ||
+    detail === 'rail' ||
+    detail === 'subway' ||
+    detail === 'tram' ||
+    detail === 'light_rail' ||
+    detail === 'narrow_gauge' ||
+    detail === 'monorail' ||
+    detail === 'funicular' ||
+    detail === 'preserved' ||
+    detail === 'miniature' ||
+    detail === 'cable_car' ||
+    detail === 'gondola' ||
+    detail === 'chair_lift' ||
+    detail === 'drag_lift' ||
+    detail === 'platter' ||
+    detail === 't-bar' ||
+    detail === 'j-bar' ||
+    detail === 'magic_carpet' ||
+    detail === 'ferry' ||
+    detail === 'shuttle_train'
+  ) {
+    return 'rail';
+  }
+
+  // Not yet (or no longer) a real road on the ground.
+  if (
+    detail === 'construction' ||
+    detail === 'proposed' ||
+    detail === 'planned' ||
+    detail === 'abandoned' ||
+    detail === 'disused' ||
+    detail === 'razed' ||
+    detail === 'demolished' ||
+    detail === 'removed'
+  ) {
+    return 'unbuilt';
+  }
+
   switch (detail) {
     case 'motorway':
     case 'motorway_link':
-      return 'motorway';
     case 'trunk':
     case 'trunk_link':
+      return 'motorway';
     case 'primary':
     case 'primary_link':
       return 'major';
@@ -39,6 +88,8 @@ export function classifyRoad(
     case 'pedestrian':
     case 'steps':
     case 'track':
+    case 'bridleway':
+    case 'corridor':
       return 'path';
     case 'service':
       return 'service';
@@ -46,6 +97,9 @@ export function classifyRoad(
 
   switch (kind) {
     case 'highway':
+      // Protomaps maps OSM motorway+trunk to `kind=highway`; we already
+      // hard-blocked specific kind_detail values above, so anything that
+      // lands here is also a high-speed road we don't want.
       return 'motorway';
     case 'major_road':
       return 'major';
@@ -60,7 +114,18 @@ export function classifyRoad(
   return 'other';
 }
 
-/** Hard runnability gate. Soft penalties are applied by the matcher. */
+/**
+ * Hard runnability gate applied at graph build time. Anything `false`
+ * here is dropped from the graph entirely — the matcher never sees it.
+ * Soft penalties (busy arterials, alleys) are applied in the matcher.
+ */
 export function isRunnable(klass: RoadClass): boolean {
-  return klass !== 'motorway';
+  return klass !== 'motorway' && klass !== 'rail' && klass !== 'unbuilt';
 }
+
+/**
+ * Version of the classification rules. Bumped whenever classifyRoad or
+ * isRunnable changes behavior; the tile cache includes this in its key
+ * so old entries are ignored after a rule change.
+ */
+export const CLASSIFIER_VERSION = 2;

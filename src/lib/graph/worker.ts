@@ -338,6 +338,143 @@ function stitch(
     for (const id of ids) counts[id]++;
   }
 
+  // --- T-intersection snap (vertex-on-edge) ---
+  //
+  // OSM sometimes has a side street ending on the *interior* of a main
+  // road's polyline with no shared junction node. Pass 1's endpoint-to-
+  // endpoint merge misses those — the side street's endpoint has
+  // count = 1 (only its own segment uses that canonical node) and the
+  // side street ends up disconnected, eventually pruned as a small
+  // component.
+  //
+  // To repair: project each level-0 segment endpoint whose canonical
+  // node has count = 1 onto nearby level-0 sub-edges. When the
+  // projection lands strictly inside a host sub-edge (≥ EPS_M from
+  // either of its endpoints, so we don't create sliver edges) and
+  // within SNAP_EPS_M of the dangling endpoint, splice a new vertex
+  // into the host's polyline carrying the dangling endpoint's
+  // canonical id. That bumps counts[id] from 1 → 2, which is exactly
+  // the condition Pass 3 uses to split the host edge — fusing the
+  // side street into the main road.
+  //
+  // Level 0 only: we don't want a ground endpoint snapping onto a
+  // bridge's interior or vice versa.
+
+  const SNAP_EPS_M = 3;
+  const SNAP_EPS_M2 = SNAP_EPS_M * SNAP_EPS_M;
+  const EPS_M2 = EPS_M * EPS_M;
+  const SUB_CELL_M = SNAP_EPS_M * 2;
+  const subCellLat = SUB_CELL_M / M_PER_DEG_LAT;
+  const subCellLng = SUB_CELL_M / (M_PER_DEG_LAT * Math.cos((refLat * Math.PI) / 180));
+  const cosLat = Math.cos((refLat * Math.PI) / 180);
+
+  interface SubRef { s: number; i: number; }
+  const subGrid = new Map<string, SubRef[]>();
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s];
+    if (seg.level !== 0) continue;
+    for (let i = 0; i < seg.coords.length - 1; i++) {
+      const a = seg.coords[i];
+      const b = seg.coords[i + 1];
+      const minCx = Math.floor(Math.min(a[0], b[0]) / subCellLng);
+      const maxCx = Math.floor(Math.max(a[0], b[0]) / subCellLng);
+      const minCy = Math.floor(Math.min(a[1], b[1]) / subCellLat);
+      const maxCy = Math.floor(Math.max(a[1], b[1]) / subCellLat);
+      for (let cx = minCx; cx <= maxCx; cx++) {
+        for (let cy = minCy; cy <= maxCy; cy++) {
+          const k = `${cx},${cy}`;
+          const arr = subGrid.get(k);
+          if (arr) arr.push({ s, i });
+          else subGrid.set(k, [{ s, i }]);
+        }
+      }
+    }
+  }
+
+  interface Insertion {
+    s: number;
+    i: number;
+    t: number;
+    newPt: [number, number];
+    canonicalId: number;
+  }
+  const insertions: Insertion[] = [];
+
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s];
+    if (seg.level !== 0) continue;
+    const ids = vertNodeIds[s];
+    const lastIdx = ids.length - 1;
+    if (lastIdx < 1) continue;
+    for (const idx of [0, lastIdx]) {
+      const nodeId = ids[idx];
+      if (counts[nodeId] !== 1) continue;
+      const pLng = seg.coords[idx][0];
+      const pLat = seg.coords[idx][1];
+      const cx = Math.floor(pLng / subCellLng);
+      const cy = Math.floor(pLat / subCellLat);
+      let bestD2 = SNAP_EPS_M2;
+      let best: Insertion | null = null;
+      for (let ddx = -1; ddx <= 1; ddx++) {
+        for (let ddy = -1; ddy <= 1; ddy++) {
+          const arr = subGrid.get(`${cx + ddx},${cy + ddy}`);
+          if (!arr) continue;
+          for (const ref of arr) {
+            if (ref.s === s) continue; // don't snap a segment onto itself
+            const hostSeg = segments[ref.s];
+            const a = hostSeg.coords[ref.i];
+            const b = hostSeg.coords[ref.i + 1];
+            // Local-meter frame anchored at the dangling endpoint.
+            const ax = (a[0] - pLng) * cosLat * M_PER_DEG_LAT;
+            const ay = (a[1] - pLat) * M_PER_DEG_LAT;
+            const bx = (b[0] - pLng) * cosLat * M_PER_DEG_LAT;
+            const by = (b[1] - pLat) * M_PER_DEG_LAT;
+            const dx = bx - ax;
+            const dy = by - ay;
+            const len2 = dx * dx + dy * dy;
+            if (len2 === 0) continue;
+            const t = -(ax * dx + ay * dy) / len2;
+            if (t <= 0 || t >= 1) continue;
+            const qx = ax + t * dx;
+            const qy = ay + t * dy;
+            const d2 = qx * qx + qy * qy;
+            if (d2 >= bestD2) continue;
+            // Reject snaps within Pass-1 ε of a host endpoint: Pass 1
+            // would already have merged the endpoints if they were
+            // that close, and splitting here would emit a sliver edge.
+            const dToA2 = (qx - ax) * (qx - ax) + (qy - ay) * (qy - ay);
+            const dToB2 = (qx - bx) * (qx - bx) + (qy - by) * (qy - by);
+            if (dToA2 < EPS_M2 || dToB2 < EPS_M2) continue;
+            const hostIds = vertNodeIds[ref.s];
+            if (hostIds[ref.i] === nodeId || hostIds[ref.i + 1] === nodeId) continue;
+            bestD2 = d2;
+            best = {
+              s: ref.s,
+              i: ref.i,
+              t,
+              newPt: [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])],
+              canonicalId: nodeId,
+            };
+          }
+        }
+      }
+      if (best) insertions.push(best);
+    }
+  }
+
+  // Apply insertions: ascending host segment, then descending sub-edge
+  // index, then descending t within the same sub-edge — so each splice
+  // leaves the indices of unprocessed insertions intact.
+  insertions.sort((x, y) => x.s - y.s || y.i - x.i || y.t - x.t);
+  for (const ins of insertions) {
+    segments[ins.s].coords.splice(ins.i + 1, 0, ins.newPt);
+    vertNodeIds[ins.s].splice(ins.i + 1, 0, ins.canonicalId);
+    counts[ins.canonicalId]++;
+  }
+  if (insertions.length > 0) {
+    console.log(`[graph] vertex-on-edge: snapped ${insertions.length} dangling endpoints`);
+  }
+
   // Pass 3: split at any canonical node with count ≥ 2 (intersection)
   // or at linestring endpoints.
   const edges: GraphEdge[] = [];

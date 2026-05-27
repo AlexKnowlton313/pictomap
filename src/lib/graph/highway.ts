@@ -129,4 +129,4 @@ export function isRunnable(klass: RoadClass): boolean {
  * in a way that would make older cached entries wrong. The tile cache
  * includes this in its key, so a bump invalidates stale entries.
  */
-export const CLASSIFIER_VERSION = 3;
+export const CLASSIFIER_VERSION = 4;

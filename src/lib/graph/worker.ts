@@ -8,7 +8,9 @@ import { Matcher } from './matcher';
 import { TileCache } from './tile-cache';
 import {
   GRAPH_ZOOM,
+  clipPolylineToBBox,
   polylineLength,
+  tileBounds,
   tilesCoveringBBox,
 } from './tile-math';
 import type {
@@ -186,6 +188,13 @@ async function fetchTileRoads(
   const layer = tile.layers.roads;
   if (!layer) return { segs: [], fromCache: false };
 
+  // Per-tile clip rectangle. MVT features include geometry inside a
+  // small buffer past the tile boundary; clipping back to the actual
+  // tile bounds means adjacent tiles' clip vertices coincide on the
+  // shared edge, which is what lets sparsely-vertexed roads stitch
+  // back together across tile boundaries.
+  const bounds = tileBounds(x, y, z);
+
   const segs: RawSegment[] = [];
   for (let i = 0; i < layer.length; i++) {
     const feature = layer.feature(i);
@@ -201,11 +210,16 @@ async function fetchTileRoads(
     // geometry may be a single LineString or a MultiLineString.
     const gj = feature.toGeoJSON(x, y, z);
     const geom = gj.geometry;
-    if (geom.type === 'LineString') {
-      segs.push({ coords: geom.coordinates as [number, number][], klass, level });
-    } else if (geom.type === 'MultiLineString') {
-      for (const line of geom.coordinates) {
-        segs.push({ coords: line as [number, number][], klass, level });
+    const lines: [number, number][][] =
+      geom.type === 'LineString'
+        ? [geom.coordinates as [number, number][]]
+        : geom.type === 'MultiLineString'
+          ? (geom.coordinates as [number, number][][])
+          : [];
+
+    for (const line of lines) {
+      for (const piece of clipPolylineToBBox(line, bounds)) {
+        if (piece.length >= 2) segs.push({ coords: piece, klass, level });
       }
     }
   }

@@ -316,15 +316,25 @@ function stitch(
       if (!(isShared || isLast)) continue;
 
       const chunkEnd = ids[i];
-      if (chunkStart !== chunkEnd && chunk.length >= 2) {
-        edges.push({
-          id: edges.length,
-          a: chunkStart,
-          b: chunkEnd,
-          coords: chunk,
-          length: polylineLength(chunk),
-          klass: seg.klass,
-        });
+      // Two emit conditions:
+      //   - normal edge: chunkStart != chunkEnd, length >= 2
+      //   - self-loop edge: chunkStart == chunkEnd with >= 3 vertices,
+      //     i.e. a closed standalone way (roundabout, traffic circle,
+      //     parking loop) or a linestring that doubled back to a
+      //     shared node. Without this, those features would be dropped.
+      const isLoop = chunkStart === chunkEnd;
+      if ((!isLoop && chunk.length >= 2) || (isLoop && chunk.length >= 3)) {
+        const len = polylineLength(chunk);
+        if (len > 0) {
+          edges.push({
+            id: edges.length,
+            a: chunkStart,
+            b: chunkEnd,
+            coords: chunk,
+            length: len,
+            klass: seg.klass,
+          });
+        }
       }
       chunkStart = chunkEnd;
       chunk = [v];

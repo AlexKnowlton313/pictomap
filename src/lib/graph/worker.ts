@@ -116,7 +116,7 @@ async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
     `[graph] tile cache: ${stats.hits} hits / ${stats.misses} misses in ${tileFetches.length} tiles`,
   );
 
-  const stitched = stitch(segments);
+  const stitched = stitch(segments, (bbox.south + bbox.north) / 2);
   const pruned = pruneSmallComponents(stitched, MIN_COMPONENT_EDGES);
 
   return {
@@ -228,13 +228,15 @@ function featureLevel(props: Record<string, string | number | boolean>): number 
  * at level 0 so a bridge feature still connects to its at-grade
  * approach road at the abutment.
  */
-function stitch(segments: RawSegment[]): { nodes: GraphNode[]; edges: GraphEdge[] } {
+function stitch(
+  segments: RawSegment[],
+  refLat: number,
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
   if (segments.length === 0) return { nodes: [], edges: [] };
 
-  // Pick a reference latitude for the lng-degrees-per-meter scale. Using
-  // the first vertex is fine — the graph spans only a few km so the cosine
-  // doesn't change meaningfully.
-  const refLat = segments[0].coords[0][1];
+  // refLat is the bbox center: viewport-driven rebuilds now span tens of
+  // km at low zoom, so picking a corner vertex would bias the lng scale
+  // toward one side of the graph.
   const EPS_M = 2;
   const M_PER_DEG_LAT = 111_320;
   const epsLat = EPS_M / M_PER_DEG_LAT;

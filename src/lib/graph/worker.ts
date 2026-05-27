@@ -97,23 +97,45 @@ interface RawSegment {
 /** Components with fewer edges than this get dropped at graph build. */
 const MIN_COMPONENT_EDGES = 20;
 
+/**
+ * Max concurrent PMTiles range requests. At low zoom the buffered
+ * viewport can demand hundreds of tiles; firing them all in parallel
+ * would spike the host. 16 keeps the pipe saturated while staying
+ * well under typical CloudFront/S3 origin limits.
+ */
+const TILE_FETCH_CONCURRENCY = 16;
+
 async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
   const t0 = performance.now();
   const range = tilesCoveringBBox(bbox, GRAPH_ZOOM);
-  const segments: RawSegment[] = [];
   const stats = { hits: 0, misses: 0 };
 
-  const tileFetches: Promise<RawSegment[]>[] = [];
+  const tileCoords: { x: number; y: number }[] = [];
   for (let x = range.minX; x <= range.maxX; x++) {
     for (let y = range.minY; y <= range.maxY; y++) {
-      tileFetches.push(fetchTileRoads(p, range.z, x, y, tileCache, stats));
+      tileCoords.push({ x, y });
     }
   }
-  const tileResults = await Promise.all(tileFetches);
-  for (const segs of tileResults) segments.push(...segs);
+
+  const segments: RawSegment[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const i = next++;
+      if (i >= tileCoords.length) return;
+      const { x, y } = tileCoords[i];
+      const segs = await fetchTileRoads(p, range.z, x, y, tileCache, stats);
+      for (const s of segs) segments.push(s);
+    }
+  };
+  const pool = Array.from(
+    { length: Math.min(TILE_FETCH_CONCURRENCY, tileCoords.length) },
+    () => worker(),
+  );
+  await Promise.all(pool);
 
   console.log(
-    `[graph] tile cache: ${stats.hits} hits / ${stats.misses} misses in ${tileFetches.length} tiles`,
+    `[graph] tile cache: ${stats.hits} hits / ${stats.misses} misses in ${tileCoords.length} tiles`,
   );
 
   const stitched = stitch(segments, (bbox.south + bbox.north) / 2);
@@ -124,7 +146,7 @@ async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
     edges: pruned.edges,
     bbox,
     buildMs: Math.round(performance.now() - t0),
-    tileCount: tileFetches.length,
+    tileCount: tileCoords.length,
   };
 }
 

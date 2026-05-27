@@ -118,14 +118,17 @@ async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
   }
 
   const segments: RawSegment[] = [];
+  /** Cache misses to flush in one IDB transaction after the fetch pass. */
+  const cacheWrites: { z: number; x: number; y: number; segs: RawSegment[] }[] = [];
   let next = 0;
   const worker = async (): Promise<void> => {
     while (true) {
       const i = next++;
       if (i >= tileCoords.length) return;
       const { x, y } = tileCoords[i];
-      const segs = await fetchTileRoads(p, range.z, x, y, tileCache, stats);
+      const { segs, fromCache } = await fetchTileRoads(p, range.z, x, y, tileCache, stats);
       for (const s of segs) segments.push(s);
+      if (!fromCache) cacheWrites.push({ z: range.z, x, y, segs });
     }
   };
   const pool = Array.from(
@@ -133,6 +136,12 @@ async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
     () => worker(),
   );
   await Promise.all(pool);
+
+  // Flush all cache misses in a single readwrite transaction. Fire-
+  // and-forget — the graph build doesn't wait for IndexedDB to commit.
+  if (tileCache && cacheWrites.length > 0) {
+    void tileCache.putBatch(cacheWrites);
+  }
 
   console.log(
     `[graph] tile cache: ${stats.hits} hits / ${stats.misses} misses in ${tileCoords.length} tiles`,
@@ -157,29 +166,25 @@ async function fetchTileRoads(
   y: number,
   cache: TileCache | null,
   stats: { hits: number; misses: number },
-): Promise<RawSegment[]> {
+): Promise<{ segs: RawSegment[]; fromCache: boolean }> {
   if (cache) {
     const cached = await cache.get(z, x, y);
     if (cached) {
       stats.hits++;
-      return cached;
+      return { segs: cached, fromCache: true };
     }
   }
   stats.misses++;
 
   const res = await p.getZxy(z, x, y);
   if (!res) {
-    // Cache the empty result too — saves a 404 round-trip next time.
-    if (cache) void cache.put(z, x, y, []);
-    return [];
+    // Empty result is cached too — saves a 404 round-trip next time.
+    return { segs: [], fromCache: false };
   }
 
   const tile = new VectorTile(new Pbf(new Uint8Array(res.data)));
   const layer = tile.layers.roads;
-  if (!layer) {
-    if (cache) void cache.put(z, x, y, []);
-    return [];
-  }
+  if (!layer) return { segs: [], fromCache: false };
 
   const segs: RawSegment[] = [];
   for (let i = 0; i < layer.length; i++) {
@@ -205,8 +210,7 @@ async function fetchTileRoads(
     }
   }
 
-  if (cache) void cache.put(z, x, y, segs);
-  return segs;
+  return { segs, fromCache: false };
 }
 
 /**

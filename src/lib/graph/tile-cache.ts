@@ -77,12 +77,25 @@ export class TileCache {
   }
 
   async put(z: number, x: number, y: number, segs: CachedSegment[]): Promise<void> {
+    return this.putBatch([{ z, x, y, segs }]);
+  }
+
+  /**
+   * Write many tiles in a single readwrite transaction. Used by
+   * buildGraph to flush all cache misses at the end of a build instead
+   * of opening one transaction per tile.
+   */
+  async putBatch(
+    entries: { z: number; x: number; y: number; segs: CachedSegment[] }[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
     const db = await this.dbP;
     if (!db) return;
     return new Promise((resolve) => {
       try {
         const tx = db.transaction(STORE, 'readwrite');
-        tx.objectStore(STORE).put(segs, this.key(z, x, y));
+        const store = tx.objectStore(STORE);
+        for (const e of entries) store.put(e.segs, this.key(e.z, e.x, e.y));
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
         tx.onabort = () => resolve();

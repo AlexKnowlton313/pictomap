@@ -82,10 +82,16 @@ while IFS= read -r region; do
 
   echo "[${i}/${REGION_COUNT}] ${REGION_NAME} (${BBOX})"
 
-  pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
-    --minzoom="$MIN_ZOOM" \
-    --maxzoom="$MAX_ZOOM" \
-    --bbox="$BBOX"
+  # pmtiles extract is chatty (progress bars + per-tile counts on stderr).
+  # Capture to a log and only surface it if the command fails.
+  PMTILES_LOG="${TMP_DIR}/pmtiles-${REGION_ID}.log"
+  if ! pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
+      --minzoom="$MIN_ZOOM" \
+      --maxzoom="$MAX_ZOOM" \
+      --bbox="$BBOX" >"$PMTILES_LOG" 2>&1; then
+    cat "$PMTILES_LOG" >&2
+    exit 1
+  fi
 
   SIZE_BYTES=$(stat -f%z "$OUTPUT_PATH" 2>/dev/null || stat -c%s "$OUTPUT_PATH")
   SIZE_HUMAN=$(du -h "$OUTPUT_PATH" | cut -f1)
@@ -98,7 +104,8 @@ while IFS= read -r region; do
 
   aws s3 cp "$OUTPUT_PATH" "${S3_PREFIX}/${OUTPUT_NAME}" \
     --content-type application/octet-stream \
-    --cache-control "public, max-age=31536000, immutable"
+    --cache-control "public, max-age=31536000, immutable" \
+    --only-show-errors
 
   # Free disk before extracting the next region (matters on small CI runners).
   rm "$OUTPUT_PATH"
@@ -135,6 +142,7 @@ jq -n \
 
 aws s3 cp "$MANIFEST_PATH" "${S3_PREFIX}/manifest.json" \
   --content-type application/json \
-  --cache-control "public, max-age=300"
+  --cache-control "public, max-age=300" \
+  --only-show-errors
 
 echo "Manifest uploaded to ${S3_PREFIX}/manifest.json"

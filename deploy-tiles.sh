@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
-# Build & upload the basemap / road-graph PMTiles archive.
+# Build & upload regional basemap / road-graph PMTiles archives.
 #
-# Approach: extract a zoom-bounded subset from Protomaps' daily planet PMTiles
-# via HTTP range requests (`pmtiles extract`). Avoids running our own planetiler
-# build while keeping schema compatibility with src/lib/graph/worker.ts, which
-# was written against Protomaps' MVT schema.
+# Approach: extract a zoom-bounded, bbox-bounded subset from Protomaps' daily
+# planet PMTiles via HTTP range requests (`pmtiles extract`) for each region in
+# tiles/regions.json. Each regional archive must stay under CloudFront's 30GB
+# per-object cap — the script hard-fails if any region exceeds it (split that
+# region's bbox into smaller pieces in tiles/regions.json and re-run).
 #
-# Defaults pull only z10-z14: app minZoom is 12 (src/lib/map/Map.svelte) and
-# the matcher fetches z14 tiles, so z10-z14 covers what we render plus a small
-# buffer. Override with MIN_ZOOM / MAX_ZOOM env vars.
+# Defaults pull only z12-z14: app minZoom is 12 (src/lib/map/Map.svelte) and
+# the matcher fetches z14 tiles, so this matches exactly what the app uses.
+# Override with MIN_ZOOM / MAX_ZOOM env vars.
 #
-# Output object is uniquely named (date + zoom range) and uploaded with a long
-# immutable Cache-Control, so no CloudFront invalidation is needed. The S3 URL
-# is printed at the end — wire it into VITE_PMTILES_URL once the CDN backs it.
+# Outputs are date-versioned and uploaded with immutable Cache-Control. A
+# manifest.json at a stable URL lists every region's current URL — the app
+# fetches the manifest at startup and picks a region by geolocation, so tile
+# refreshes don't require an app redeploy.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-MIN_ZOOM="${MIN_ZOOM:-10}"
+MIN_ZOOM="${MIN_ZOOM:-12}"
 MAX_ZOOM="${MAX_ZOOM:-14}"
 S3_PREFIX="${S3_PREFIX:-s3://alex-knowlton/pictomap/tiles}"
+REGIONS_FILE="${REGIONS_FILE:-tiles/regions.json}"
+MAX_BYTES=32212254720   # 30 * 1024^3 — CloudFront's per-object response cap
 
-# Protomaps rotates daily builds and today's may not be published yet; default
-# to yesterday UTC. macOS uses BSD `date -v`; Linux (CI) uses GNU `date -d`.
 yesterday_utc() {
   if date -u -v-1d +%Y%m%d >/dev/null 2>&1; then
     date -u -v-1d +%Y%m%d
@@ -33,26 +35,23 @@ yesterday_utc() {
 SOURCE_DATE="${SOURCE_DATE:-$(yesterday_utc)}"
 SOURCE_URL="https://build.protomaps.com/${SOURCE_DATE}.pmtiles"
 
-OUTPUT_NAME="pictomap-planet-${SOURCE_DATE}-z${MIN_ZOOM}-z${MAX_ZOOM}.pmtiles"
 TMP_DIR="$(mktemp -d)"
-OUTPUT_PATH="${TMP_DIR}/${OUTPUT_NAME}"
-
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-for cmd in pmtiles aws curl; do
+for cmd in pmtiles aws curl jq; do
   if ! command -v "$cmd" >/dev/null; then
     echo "missing dependency: $cmd" >&2
-    if [[ "$cmd" == "pmtiles" ]]; then
-      echo "  install with: brew install pmtiles" >&2
-    fi
+    case "$cmd" in
+      pmtiles|jq) echo "  install with: brew install $cmd" >&2 ;;
+    esac
     exit 1
   fi
 done
 
-echo "Source: $SOURCE_URL"
-echo "Output: $OUTPUT_NAME"
-echo "Zooms:  z${MIN_ZOOM}-z${MAX_ZOOM}"
-echo
+if [ ! -f "$REGIONS_FILE" ]; then
+  echo "regions file not found: $REGIONS_FILE" >&2
+  exit 1
+fi
 
 if ! curl -sfI "$SOURCE_URL" >/dev/null; then
   echo "Source not reachable — Protomaps rotates daily builds." >&2
@@ -61,19 +60,81 @@ if ! curl -sfI "$SOURCE_URL" >/dev/null; then
   exit 1
 fi
 
-pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
-  --minzoom="$MIN_ZOOM" \
-  --maxzoom="$MAX_ZOOM"
-
-SIZE=$(du -h "$OUTPUT_PATH" | cut -f1)
+REGION_COUNT=$(jq 'length' "$REGIONS_FILE")
+echo "Source: $SOURCE_URL"
+echo "Zooms:  z${MIN_ZOOM}-z${MAX_ZOOM}"
+echo "Regions: $REGION_COUNT (from $REGIONS_FILE)"
 echo
-echo "Built: $OUTPUT_NAME ($SIZE)"
 
-DEST="${S3_PREFIX}/${OUTPUT_NAME}"
-aws s3 cp "$OUTPUT_PATH" "$DEST" \
-  --content-type application/octet-stream \
-  --cache-control "public, max-age=31536000, immutable"
+# Accumulate per-region entries for the manifest. Each entry merges the region
+# config (id, name, bbox) with the published URL and on-disk size.
+MANIFEST_REGIONS="[]"
 
-echo
-echo "Uploaded: $DEST"
-echo "Point VITE_PMTILES_URL at the CloudFront URL backing this object."
+i=0
+while IFS= read -r region; do
+  i=$((i + 1))
+  REGION_ID=$(jq -r '.id' <<<"$region")
+  REGION_NAME=$(jq -r '.name' <<<"$region")
+  BBOX=$(jq -r '.bbox | join(",")' <<<"$region")
+
+  OUTPUT_NAME="pictomap-${REGION_ID}-${SOURCE_DATE}-z${MIN_ZOOM}-z${MAX_ZOOM}.pmtiles"
+  OUTPUT_PATH="${TMP_DIR}/${OUTPUT_NAME}"
+
+  echo "[${i}/${REGION_COUNT}] ${REGION_NAME} (${BBOX})"
+
+  pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
+    --minzoom="$MIN_ZOOM" \
+    --maxzoom="$MAX_ZOOM" \
+    --bbox="$BBOX"
+
+  SIZE_BYTES=$(stat -f%z "$OUTPUT_PATH" 2>/dev/null || stat -c%s "$OUTPUT_PATH")
+  SIZE_HUMAN=$(du -h "$OUTPUT_PATH" | cut -f1)
+  echo "    -> ${OUTPUT_NAME} (${SIZE_HUMAN})"
+
+  if [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
+    echo "    ERROR: region exceeds 30GB CloudFront limit — split this region's bbox in tiles/regions.json" >&2
+    exit 1
+  fi
+
+  aws s3 cp "$OUTPUT_PATH" "${S3_PREFIX}/${OUTPUT_NAME}" \
+    --content-type application/octet-stream \
+    --cache-control "public, max-age=31536000, immutable"
+
+  # Free disk before extracting the next region (matters on small CI runners).
+  rm "$OUTPUT_PATH"
+
+  # Manifest stores bare filename so the app resolves tile URLs relative to
+  # the manifest URL — works the same in dev (Vite proxy) and prod (same-origin)
+  # without any CORS configuration.
+  MANIFEST_REGIONS=$(jq \
+    --argjson region "$region" \
+    --arg filename "$OUTPUT_NAME" \
+    --argjson size "$SIZE_BYTES" \
+    '. + [$region + {filename: $filename, sizeBytes: $size}]' \
+    <<<"$MANIFEST_REGIONS")
+
+  echo
+done < <(jq -c '.[]' "$REGIONS_FILE")
+
+# Manifest URL is stable; the app hardcodes it. Short cache (5 min) so tile
+# refreshes propagate without anyone having to invalidate or redeploy.
+MANIFEST_PATH="${TMP_DIR}/manifest.json"
+jq -n \
+  --arg sourceDate "$SOURCE_DATE" \
+  --argjson minZoom "$MIN_ZOOM" \
+  --argjson maxZoom "$MAX_ZOOM" \
+  --argjson regions "$MANIFEST_REGIONS" \
+  '{
+    generatedAt: (now | todateiso8601),
+    sourceDate: $sourceDate,
+    minZoom: $minZoom,
+    maxZoom: $maxZoom,
+    regions: $regions
+  }' \
+  > "$MANIFEST_PATH"
+
+aws s3 cp "$MANIFEST_PATH" "${S3_PREFIX}/manifest.json" \
+  --content-type application/json \
+  --cache-control "public, max-age=300"
+
+echo "Manifest uploaded to ${S3_PREFIX}/manifest.json"

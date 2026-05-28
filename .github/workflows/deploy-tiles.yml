@@ -1,6 +1,11 @@
-# Weekly: extract a zoom-bounded planet PMTiles archive from Protomaps' daily
-# build and upload to S3. Date-versioned object, immutable cache, no CloudFront
-# invalidation needed — switching the app over is a VITE_PMTILES_URL update.
+# Weekly: extract regional PMTiles archives from Protomaps' daily planet build
+# and upload them to S3, plus a manifest.json at a stable URL listing every
+# region. Date-versioned objects, immutable cache, no invalidation needed —
+# the app fetches the manifest at runtime and picks a region by geolocation,
+# so tile refreshes don't require an app redeploy.
+#
+# Regions are defined in tiles/regions.json. Each must stay under CloudFront's
+# 30GB per-object cap; the script hard-fails if any region exceeds it.
 #
 # One-time AWS setup:
 #   1. Same OIDC provider as deploy.yml.
@@ -21,7 +26,7 @@ on:
       min_zoom:
         description: Minimum zoom level
         required: false
-        default: '10'
+        default: '12'
       max_zoom:
         description: Maximum zoom level
         required: false
@@ -45,8 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Standard runners ship with ~14GB free of 80GB. The extract for
-      # z10-z14 globally lands in tens of GB, so reclaim space first.
+      # Standard runners ship with ~14GB free of 80GB. Per-region extracts
+      # are smaller than the global build was, but the largest single region
+      # (East Asia + N Eurasia) could still approach the cap, so reclaim disk.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -74,7 +80,7 @@ jobs:
 
       - name: Build & upload
         env:
-          MIN_ZOOM: ${{ inputs.min_zoom || '10' }}
+          MIN_ZOOM: ${{ inputs.min_zoom || '12' }}
           MAX_ZOOM: ${{ inputs.max_zoom || '14' }}
           SOURCE_DATE: ${{ inputs.source_date }}
         run: |

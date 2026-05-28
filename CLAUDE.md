@@ -9,18 +9,22 @@ Pictomap is a single-page Svelte 5 + TypeScript + Vite app that turns an uploade
 ## Commands
 
 ```bash
-npm run dev      # HTTPS dev server (HMR). HTTPS is required — see below.
-npm run check    # svelte-check + TypeScript type-check, no build
-npm run build    # type-check, then produce dist/
-npm run preview  # serve the built dist/ locally
-./deploy.sh      # build + sync dist/ to S3 + invalidate CloudFront (prod)
+npm run dev          # HTTPS dev server (HMR). HTTPS is required — see below.
+npm run check        # svelte-check + TypeScript type-check, no build
+npm run build        # type-check, then produce dist/
+npm run preview      # serve the built dist/ locally
+./deploy.sh          # build + sync dist/ to S3 + invalidate CloudFront (prod)
+./deploy-tiles.sh    # extract regional PMTiles + manifest, upload to S3
 ```
 
 There is no test runner configured. Verification is manual (run the app, drag an image, watch the matcher log).
 
 ## Required environment
 
-Copy `.env.example` to `.env` before first run. `VITE_PMTILES_URL` **must** be set; the map will refuse to mount without it. In dev, point it at the Vite proxy path `/pmtiles/<YYYYMMDD>.pmtiles` (proxies to build.protomaps.com, which doesn't send CORS headers — the proxy is defined in `vite.config.ts`). Builds rotate daily, so a stale date will 404 — pick a recent one from https://build.protomaps.com/. In prod, use a full URL to a CORS-enabled host.
+Copy `.env.example` to `.env` before first run. Both env vars are optional:
+
+- `VITE_TILES_MANIFEST_URL` — defaults to `/tiles/manifest.json`. The Vite dev server proxies `/tiles/*` to the production CloudFront (see `vite.config.ts`), so the default works locally without any setup. Override only when testing a staging or local manifest.
+- `VITE_SENTRY_DSN` — leave blank to disable error reporting locally.
 
 ## HTTPS dev server
 
@@ -30,7 +34,7 @@ Copy `.env.example` to `.env` before first run. `VITE_PMTILES_URL` **must** be s
 
 The app has four moving parts that communicate through small reactive stores (Svelte 5 runes — `$state`, `$state.raw`):
 
-1. **Map** (`src/lib/map/`) — MapLibre instance with a Protomaps PMTiles basemap. Owns geolocation, the user marker, the debug graph layer, and the matched-route layer. Publishes the live `Map` to `mapStore.instance` so the Overlay can read screen ↔ lng/lat math without prop-drilling.
+1. **Map** (`src/lib/map/`) — MapLibre instance with a Protomaps PMTiles basemap. Owns geolocation, the user marker, the debug graph layer, and the matched-route layer. Publishes the live `Map` to `mapStore.instance` so the Overlay can read screen ↔ lng/lat math without prop-drilling. Boot is async: fetches the tile manifest + geolocates in parallel, then picks a region and creates the map with that region's PMTiles URL and bbox-locked `maxBounds`.
 
 2. **Image → contour pipeline** (`src/lib/image/`) — `ImageUploader` loads the file; `ContourEditor` runs `extractContour` (threshold → largest-connected-component → Moore-neighbor boundary trace → RDP simplify to 30–100 points) with a live threshold slider. Output is `Point[]` in source-image pixel space.
 
@@ -89,4 +93,20 @@ Don't mix these. The boundaries are: `projectContourToLngLat` (pixel → lng/lat
 
 ## Deployment
 
-`./deploy.sh` builds and syncs to `s3://alex-knowlton/pictomap/`, then invalidates CloudFront. The PMTiles archive is hosted separately; the deploy script doesn't touch it. See `tasks.md` § Tile data for the planetiler/Geofabrik build process.
+Two independent pipelines:
+
+- **App** (`./deploy.sh`, GitHub Actions `deploy.yml` on push to main): builds and syncs to `s3://alex-knowlton/pictomap/`, invalidates CloudFront. Doesn't bake in tile URLs — the app fetches the manifest at runtime.
+- **Tiles** (`./deploy-tiles.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL.
+
+### Tiles architecture
+
+Regions are defined in `tiles/regions.json` (id, name, bbox per region). The build script hard-fails if any region exceeds **30GB** (CloudFront's per-object response cap) — split that region's bbox into smaller pieces when this happens. The app:
+
+1. Fetches `/tiles/manifest.json` at startup.
+2. Geolocates the user (falls back to Manhattan).
+3. Picks the region whose bbox contains the user (first-match in the manifest order; nearest-centroid fallback for users outside every bbox).
+4. Creates the MapLibre map with the region's PMTiles URL and `maxBounds` locked to the region bbox.
+
+Crossing into another region requires a page refresh — `maxBounds` blocks panning out, and the "Re-center" button surfaces an out-of-region banner if geolocation lands the user elsewhere.
+
+The manifest URL is stable, so tile rebuilds (weekly) don't require an app redeploy — clients just pick up the new entries on next page load.

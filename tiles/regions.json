@@ -1,0 +1,10 @@
+[
+  { "id": "na",     "name": "North America",            "bbox": [-170,   7,  -50, 84] },
+  { "id": "sa",     "name": "South America",            "bbox": [ -90, -57,  -32, 14] },
+  { "id": "eu",     "name": "Europe",                   "bbox": [ -25,  34,   50, 72] },
+  { "id": "af",     "name": "Africa",                   "bbox": [ -25, -36,   55, 38] },
+  { "id": "me",     "name": "Middle East",              "bbox": [  25,  12,   65, 45] },
+  { "id": "sas",    "name": "South Asia",               "bbox": [  60,   5,   95, 40] },
+  { "id": "eas",    "name": "East Asia + N Eurasia",    "bbox": [  50,  17,  180, 78] },
+  { "id": "sea-oc", "name": "Southeast Asia + Oceania", "bbox": [  90, -50,  180, 25] }
+]

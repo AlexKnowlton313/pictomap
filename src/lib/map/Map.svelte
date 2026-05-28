@@ -17,6 +17,14 @@
   import { bboxContains, expandBBox } from '../graph/tile-math';
   import type { BBox, RoadGraph } from '../graph/types';
   import { state as appState } from '../state.svelte';
+  import {
+    DEFAULT_MANIFEST_URL,
+    fetchManifest,
+    isInRegion,
+    resolveRegionUrl,
+    selectRegion,
+    type ManifestRegion,
+  } from '../tiles/manifest';
 
   let container: HTMLDivElement;
   let map: maplibregl.Map | null = null;
@@ -24,10 +32,14 @@
   let userLocation = $state<LngLat | null>(null);
   let locating = $state(false);
   let geoError = $state<string | null>(null);
-  let mapMissing = $state(false);
+  let booting = $state(true);
+  let bootError = $state<string | null>(null);
+  let currentRegion = $state<ManifestRegion | null>(null);
+  let outOfRegion = $state(false);
   let showGraph = $state(false);
 
-  const pmtilesUrl = import.meta.env.VITE_PMTILES_URL;
+  const MANIFEST_URL =
+    import.meta.env.VITE_TILES_MANIFEST_URL || DEFAULT_MANIFEST_URL;
 
   /**
    * Extra meters kept around the visible viewport in the graph bbox.
@@ -60,21 +72,27 @@
   }
 
   async function locate(): Promise<void> {
+    if (!map || !currentRegion) return;
     locating = true;
     geoError = null;
+    outOfRegion = false;
     try {
       const pos = await getCurrentPosition();
       userLocation = pos;
+      if (!isInRegion(currentRegion, pos.lng, pos.lat)) {
+        // Outside the current region's maxBounds — flyTo would clamp and
+        // the marker would be invisible. Prompt the user to refresh so we
+        // can pick the right region on next boot.
+        outOfRegion = true;
+        return;
+      }
       showUserMarker(pos);
-      // flyTo's moveend will trigger the graph rebuild for the user location.
-      map?.flyTo({ center: [pos.lng, pos.lat], zoom: LOCATED_ZOOM, essential: true });
+      map.flyTo({ center: [pos.lng, pos.lat], zoom: LOCATED_ZOOM, essential: true });
     } catch (err) {
       const code = (err as GeolocationPositionError | undefined)?.code;
       if (code === 1) geoError = 'Location permission denied';
       else if (code === 3) geoError = 'Location request timed out';
       else geoError = 'Could not get location';
-      // No flyTo, so prime the build for whatever view we're currently on.
-      scheduleRebuild(0);
     } finally {
       locating = false;
     }
@@ -244,19 +262,22 @@
     renderRoute(appState.matched ? appState.matched.coords : null);
   });
 
-  onMount(async () => {
-    if (!pmtilesUrl) {
-      mapMissing = true;
-      return;
-    }
+  function initMap(region: ManifestRegion, center: LngLat, located: boolean): void {
+    const pmtilesUrl = resolveRegionUrl(MANIFEST_URL, region);
     registerPMTilesProtocol();
 
     map = new maplibregl.Map({
       container,
       style: buildBasemapStyle(pmtilesUrl),
-      center: [FALLBACK_LOCATION.lng, FALLBACK_LOCATION.lat],
-      zoom: FALLBACK_ZOOM,
+      center: [center.lng, center.lat],
+      zoom: located ? LOCATED_ZOOM : FALLBACK_ZOOM,
       minZoom: MIN_ZOOM,
+      // Lock panning to the region we have tiles for. Crossing into another
+      // region requires a page refresh so we can re-pick the manifest entry.
+      maxBounds: [
+        [region.bbox[0], region.bbox[1]],
+        [region.bbox[2], region.bbox[3]],
+      ],
       attributionControl: { compact: true },
       hash: false,
     });
@@ -274,9 +295,45 @@
 
     graphStore.service = new GraphService(pmtilesUrl);
 
-    // Fire-and-forget — if it fails we keep the fallback view, and
-    // the catch path inside locate() will still trigger a build.
-    locate();
+    if (located) {
+      showUserMarker(center);
+    }
+  }
+
+  async function tryGeolocate(): Promise<{ location: LngLat | null; error: string | null }> {
+    try {
+      return { location: await getCurrentPosition(), error: null };
+    } catch (err) {
+      const code = (err as GeolocationPositionError | undefined)?.code;
+      if (code === 1) return { location: null, error: 'Location permission denied' };
+      if (code === 3) return { location: null, error: 'Location request timed out' };
+      return { location: null, error: 'Could not get location' };
+    }
+  }
+
+  onMount(async () => {
+    try {
+      // Fetch manifest and geolocate in parallel — boot blocks on the slower
+      // of the two (usually geolocation, capped at ~7s by getCurrentPosition).
+      const [manifest, geo] = await Promise.all([
+        fetchManifest(MANIFEST_URL),
+        tryGeolocate(),
+      ]);
+
+      const initialLocation = geo.location ?? FALLBACK_LOCATION;
+      const located = geo.location !== null;
+      if (geo.location) userLocation = geo.location;
+      if (geo.error) geoError = geo.error;
+
+      const region = selectRegion(manifest, initialLocation.lng, initialLocation.lat);
+      currentRegion = region;
+
+      initMap(region, initialLocation, located);
+    } catch (err) {
+      bootError = err instanceof Error ? err.message : String(err);
+    } finally {
+      booting = false;
+    }
   });
 
   onDestroy(() => {
@@ -293,15 +350,30 @@
 
 <div class="map" bind:this={container}></div>
 
-{#if mapMissing}
+{#if booting}
+  <div class="boot-overlay">
+    <div class="boot-spinner"></div>
+    <span>Loading map…</span>
+  </div>
+{/if}
+
+{#if bootError}
   <div class="error-banner">
-    <strong>Missing <code>VITE_PMTILES_URL</code>.</strong>
-    Copy <code>.env.example</code> to <code>.env</code> and set it to a PMTiles archive URL.
+    <strong>Map failed to load.</strong>
+    {bootError}
+  </div>
+{/if}
+
+{#if outOfRegion && currentRegion}
+  <div class="info-banner">
+    Your location is outside the <strong>{currentRegion.name}</strong> tile region.
+    <button class="link" onclick={() => window.location.reload()}>Refresh</button>
+    to load tiles for your location.
   </div>
 {/if}
 
 <div class="panel">
-  <button onclick={locate} disabled={locating} title="Re-center on my location">
+  <button onclick={locate} disabled={locating || booting} title="Re-center on my location">
     {#if locating}Locating…{:else}📍 Re-center{/if}
   </button>
   <button
@@ -311,6 +383,11 @@
   >
     {showGraph ? 'Hide' : 'Show'} graph
   </button>
+  {#if currentRegion}
+    <span class="muted" title="Active tile region">
+      {currentRegion.name}
+    </span>
+  {/if}
   {#if userLocation}
     <span class="coords" title="Your location">
       {userLocation.lat.toFixed(4)}, {userLocation.lng.toFixed(4)}
@@ -387,12 +464,56 @@
     z-index: 20;
   }
 
-  .error-banner code {
-    font-family: var(--font-mono);
+  .info-banner {
+    position: absolute;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 560px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    color: var(--fg);
     font-size: 13px;
-    background: rgba(255, 255, 255, 0.06);
-    padding: 1px 6px;
-    border-radius: 4px;
+    z-index: 20;
+  }
+
+  .info-banner .link {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+    font: inherit;
+  }
+
+  .boot-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: var(--panel);
+    color: var(--fg);
+    font-size: 14px;
+    z-index: 30;
+  }
+
+  .boot-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--panel-border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
   }
 
   :global(.user-marker) {

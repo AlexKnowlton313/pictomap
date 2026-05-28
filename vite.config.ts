@@ -10,15 +10,14 @@ export default defineConfig({
   server: {
     host: true,
     https: {},
-    // build.protomaps.com serves PMTiles but does not send CORS headers, so
-    // direct browser range requests are blocked. Proxy through the dev server
-    // so the browser sees a same-origin response. Dev-only; prod must point
-    // at a CORS-enabled host (see tasks.md § Tile data).
+    // Proxy /tiles/* to the production CloudFront so dev fetches the manifest
+    // and PMTiles files same-origin (no CORS setup required for local dev).
+    // Prod serves /tiles/* from the same CloudFront as the app, so the same
+    // /tiles/manifest.json path works there too.
     proxy: {
-      '/pmtiles': {
-        target: 'https://build.protomaps.com',
+      '/tiles': {
+        target: 'https://pictomap.alex-knowlton.com',
         changeOrigin: true,
-        rewrite: (p) => p.replace(/^\/pmtiles/, ''),
       },
     },
   },

@@ -86,15 +86,26 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Source $SOURCE_URL OK; regions=$REGIONS"
 
-  # One region per runner, in parallel. fail-fast: false so a single region's
-  # failure doesn't cancel the others (you still see which succeeded); assemble
-  # needs the whole build job to pass, so a failure prevents a partial manifest.
+  # One region per runner. fail-fast: false so a single region's failure doesn't
+  # cancel the others (you still see which succeeded); assemble needs the whole
+  # build job to pass, so a failure prevents a partial manifest.
+  #
+  # max-parallel caps how many shards range-read the *same* Protomaps source
+  # object at once. All shards pull from one daily .pmtiles, and the origin
+  # throttles aggregate throughput to it: 8 shards x DOWNLOAD_THREADS connections
+  # starve each other, hitting the densest regions (na, eu) hardest. 4 shards x
+  # 4 threads keeps per-shard extract near its standalone speed while still
+  # finishing in ~two waves instead of serially.
   build:
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # A healthy shard finishes in <10 min (heaviest serial extract ~3.5 min +
+    # upload + setup). Cap at 20 so a throttled shard fails fast instead of
+    # dragging toward the old 90-min limit with no visible progress.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         region: ${{ fromJson(needs.setup.outputs.regions) }}
     steps:
@@ -136,7 +147,9 @@ jobs:
           MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
           EMIT_MANIFEST: '0'
           FRAGMENT_DIR: ${{ github.workspace }}/fragments
-          DOWNLOAD_THREADS: '8'
+          # Keep low: with several shards reading the same source object,
+          # per-shard threads multiply load on the shared origin (see max-parallel).
+          DOWNLOAD_THREADS: '4'
         run: ./deploy-tiles.sh
 
       - name: Upload manifest fragment

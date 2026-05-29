@@ -42,11 +42,15 @@ const TRANSITION_CAP_MULTIPLIER = 5;
 const TRANSITION_CAP_FLOOR_M = 400;
 
 const RUNNABILITY_PENALTY: Record<RoadClass, number> = {
-  // The three hard-blocked classes below are filtered out at graph build
-  // time and should never reach the matcher; the +∞ here is defensive.
-  motorway: Number.POSITIVE_INFINITY,
+  // rail / unbuilt are hard-blocked at graph build time and should
+  // never reach the matcher; the +∞ here is defensive.
   rail: Number.POSITIVE_INFINITY,
   unbuilt: Number.POSITIVE_INFINITY,
+  // Motorways are kept in the graph and selectable. Heavy penalty so
+  // a parallel surface street is preferred whenever one exists, but
+  // not infinite — the runner gets what they asked for if the contour
+  // really wants the highway.
+  motorway: 1.5,
   major: 0.6,
   minor: 0.15,
   residential: 0,

@@ -8,10 +8,12 @@ import type { RoadClass } from './types';
  * for the OSM `highway=` value. We key off `kind_detail` when available
  * because it preserves runnability-relevant distinctions.
  *
- * Runner-safety rules (hard-blocked at the graph level):
- *   - motorways and trunks: high-speed, often no shoulder or sidewalk
- *   - rail / transit / aerialway / ferry: not roads
- *   - construction / proposed / abandoned: not actually walkable
+ * Runner-safety rules:
+ *   - rail / transit / aerialway / ferry: not roads — hard-blocked here
+ *   - construction / proposed / abandoned: not present — hard-blocked here
+ *   - motorways and trunks: high-speed, often no shoulder or sidewalk;
+ *     kept in the graph but heavily penalized in the matcher so a
+ *     parallel surface street wins whenever one exists
  */
 export function classifyRoad(
   props: Record<string, string | number | boolean>,
@@ -97,9 +99,9 @@ export function classifyRoad(
 
   switch (kind) {
     case 'highway':
-      // Protomaps maps OSM motorway+trunk to `kind=highway`; we already
-      // hard-blocked specific kind_detail values above, so anything that
-      // lands here is also a high-speed road we don't want.
+      // Protomaps maps OSM motorway+trunk to `kind=highway`. Anything
+      // that lands here is a high-speed road; classify as motorway so the
+      // matcher's runnability penalty applies (kept, but discouraged).
       return 'motorway';
     case 'major_road':
       return 'major';
@@ -120,7 +122,7 @@ export function classifyRoad(
  * Soft penalties (busy arterials, alleys) are applied in the matcher.
  */
 export function isRunnable(klass: RoadClass): boolean {
-  return klass !== 'motorway' && klass !== 'rail' && klass !== 'unbuilt';
+  return klass !== 'rail' && klass !== 'unbuilt';
 }
 
 /**
@@ -129,4 +131,4 @@ export function isRunnable(klass: RoadClass): boolean {
  * in a way that would make older cached entries wrong. The tile cache
  * includes this in its key, so a bump invalidates stale entries.
  */
-export const CLASSIFIER_VERSION = 4;
+export const CLASSIFIER_VERSION = 5;

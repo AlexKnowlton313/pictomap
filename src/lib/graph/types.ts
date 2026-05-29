@@ -6,7 +6,7 @@
  */
 
 export type RoadClass =
-  | 'motorway'    // hard-block: motorway/trunk — not safe to run on
+  | 'motorway'    // motorway/trunk — kept in graph, heavily penalized in matcher
   | 'rail'        // hard-block: trains, subways, trams, aerialways, ferries
   | 'unbuilt'     // hard-block: construction/proposed/abandoned — not actually present
   | 'major'       // busy arterials — soft penalty

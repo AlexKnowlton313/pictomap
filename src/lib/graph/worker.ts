@@ -97,7 +97,7 @@ interface RawSegment {
 }
 
 /** Components with fewer edges than this get dropped at graph build. */
-const MIN_COMPONENT_EDGES = 20;
+const MIN_COMPONENT_EDGES = 100;
 
 /**
  * Max concurrent PMTiles range requests. At low zoom the buffered
@@ -342,25 +342,30 @@ function stitch(
   //
   // OSM sometimes has a side street ending on the *interior* of a main
   // road's polyline with no shared junction node. Pass 1's endpoint-to-
-  // endpoint merge misses those — the side street's endpoint has
-  // count = 1 (only its own segment uses that canonical node) and the
-  // side street ends up disconnected, eventually pruned as a small
-  // component.
+  // endpoint merge misses those — the side street's endpoint sits on a
+  // canonical node no host shares, so the side street stays disconnected
+  // and is eventually pruned as a small component.
   //
-  // To repair: project each level-0 segment endpoint whose canonical
-  // node has count = 1 onto nearby level-0 sub-edges. When the
-  // projection lands strictly inside a host sub-edge (≥ EPS_M from
-  // either of its endpoints, so we don't create sliver edges) and
-  // within SNAP_EPS_M of the dangling endpoint, splice a new vertex
-  // into the host's polyline carrying the dangling endpoint's
-  // canonical id. That bumps counts[id] from 1 → 2, which is exactly
-  // the condition Pass 3 uses to split the host edge — fusing the
-  // side street into the main road.
+  // To repair: project every segment endpoint onto nearby level-0
+  // sub-edges. When the projection lands strictly inside a host sub-edge
+  // (≥ EPS_M from either of its endpoints, so we don't create sliver
+  // edges) and within SNAP_EPS_M of the endpoint, splice a new vertex
+  // into the host's polyline carrying the endpoint's canonical id. That
+  // bumps counts[id], which is the condition Pass 3 uses to split the
+  // host edge — fusing the side street into the main road.
   //
-  // Level 0 only: we don't want a ground endpoint snapping onto a
-  // bridge's interior or vice versa.
+  // Every endpoint is a candidate, not just count==1 danglers: a small
+  // cluster whose boundary node is already shared (count ≥ 2) but never
+  // reaches the through-network still needs an anchor onto a host. The
+  // apply step below refuses to splice a node a host already carries, so
+  // re-snapping a real junction can't manufacture a self-loop edge.
+  //
+  // Hosts are level-0 only — we don't want any endpoint snapping onto a
+  // bridge/tunnel interior. Danglers can come from any segment, since
+  // endpoints are always canonicalized at level 0 (so a bridge approach
+  // can correctly snap onto the ground road it abuts).
 
-  const SNAP_EPS_M = 3;
+  const SNAP_EPS_M = 20;
   const SNAP_EPS_M2 = SNAP_EPS_M * SNAP_EPS_M;
   const EPS_M2 = EPS_M * EPS_M;
   const SUB_CELL_M = SNAP_EPS_M * 2;
@@ -402,13 +407,11 @@ function stitch(
 
   for (let s = 0; s < segments.length; s++) {
     const seg = segments[s];
-    if (seg.level !== 0) continue;
     const ids = vertNodeIds[s];
     const lastIdx = ids.length - 1;
     if (lastIdx < 1) continue;
     for (const idx of [0, lastIdx]) {
       const nodeId = ids[idx];
-      if (counts[nodeId] !== 1) continue;
       const pLng = seg.coords[idx][0];
       const pLat = seg.coords[idx][1];
       const cx = Math.floor(pLng / subCellLng);
@@ -466,13 +469,21 @@ function stitch(
   // index, then descending t within the same sub-edge — so each splice
   // leaves the indices of unprocessed insertions intact.
   insertions.sort((x, y) => x.s - y.s || y.i - x.i || y.t - x.t);
+  let applied = 0;
   for (const ins of insertions) {
+    // Never splice a canonical node a host already carries. It's either
+    // a real junction the host happens to curve back near (already on
+    // the host from Pass 1), or the same shared node a sibling endpoint
+    // just spliced in. A second copy makes Pass 3 emit a self-loop edge
+    // (a === b) over the stretch of host between the two copies.
+    if (vertNodeIds[ins.s].includes(ins.canonicalId)) continue;
     segments[ins.s].coords.splice(ins.i + 1, 0, ins.newPt);
     vertNodeIds[ins.s].splice(ins.i + 1, 0, ins.canonicalId);
     counts[ins.canonicalId]++;
+    applied++;
   }
-  if (insertions.length > 0) {
-    console.log(`[graph] vertex-on-edge: snapped ${insertions.length} dangling endpoints`);
+  if (applied > 0) {
+    console.log(`[graph] vertex-on-edge: snapped ${applied} dangling endpoints`);
   }
 
   // Pass 3: split at any canonical node with count ≥ 2 (intersection)
@@ -574,12 +585,25 @@ function pruneSmallComponents(
   const newEdges: GraphEdge[] = [];
   let droppedEdges = 0;
   let droppedComps = 0;
+  const droppedByKlass = new Map<RoadClass, number>();
   for (let i = 0; i < compSize.length; i++) {
     if (compSize[i] < minEdges) droppedComps++;
   }
   for (let i = 0; i < edges.length; i++) {
     if (compSize[edgeComp[i]] < minEdges) {
       droppedEdges++;
+      const e = edges[i];
+      droppedByKlass.set(e.klass, (droppedByKlass.get(e.klass) ?? 0) + 1);
+      // Spot-log dropped vehicular edges so we can investigate
+      // structural isolation case-by-case. Skip path/service — those
+      // are mostly legitimately disconnected.
+      if (e.klass === 'major' || e.klass === 'minor' || e.klass === 'residential') {
+        const mid = e.coords[Math.floor(e.coords.length / 2)];
+        console.log(
+          `[graph]   dropped ${e.klass}: comp_size=${compSize[edgeComp[i]]} ` +
+          `midpoint=${mid[1].toFixed(6)},${mid[0].toFixed(6)}`,
+        );
+      }
       continue;
     }
     const e = edges[i];
@@ -606,9 +630,14 @@ function pruneSmallComponents(
   }
 
   const top = [...compSize].sort((a, b) => b - a).slice(0, 5);
+  const byKlass = [...droppedByKlass.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${k}:${n}`)
+    .join(', ');
   console.log(
     `[graph] ${compSize.length} components (top sizes: ${top.join(', ')}); ` +
-    `dropped ${droppedComps} components / ${droppedEdges} edges below ${minEdges}-edge floor`,
+    `dropped ${droppedComps} components / ${droppedEdges} edges below ${minEdges}-edge floor` +
+    (byKlass ? ` [${byKlass}]` : ''),
   );
   return { nodes: newNodes, edges: newEdges };
 }

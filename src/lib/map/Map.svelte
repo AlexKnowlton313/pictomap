@@ -133,6 +133,7 @@
         'line-color': [
           'match',
           ['get', 'klass'],
+          'motorway', '#f43f5e',
           'major', '#ff7a45',
           'minor', '#ffd24d',
           'residential', '#9fe870',

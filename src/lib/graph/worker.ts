@@ -100,6 +100,22 @@ interface RawSegment {
 const MIN_COMPONENT_EDGES = 100;
 
 /**
+ * Pass-1 proximity-merge toggle. When false, vertices merge only when
+ * their coordinates are *exactly* equal — i.e. a shared OSM node within a
+ * single tile — disabling EPS_M's radius merge entirely.
+ *
+ * EPS_M's radius merge collapses any road piece shorter than EPS_M into a
+ * single canonical node, which Pass 3 then drops (its `chunkStart ===
+ * chunkEnd` loop guard discards 2-vertex degenerate edges). Turning this
+ * off is the way to inspect the raw, un-collapsed network. The trade-off
+ * is cross-tile stitching: that relies on EPS_M to absorb the float
+ * jitter between adjacent tiles' clip points, so with this off, roads
+ * crossing tile boundaries will read as disconnected. Set back to `true`
+ * for production graphs.
+ */
+const PROXIMITY_MERGE: boolean = false;
+
+/**
  * Max concurrent PMTiles range requests. At low zoom the buffered
  * viewport can demand hundreds of tiles; firing them all in parallel
  * would spike the host. 16 keeps the pipe saturated while staying
@@ -110,7 +126,7 @@ const TILE_FETCH_CONCURRENCY = 16;
 async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
   const t0 = performance.now();
   const range = tilesCoveringBBox(bbox, GRAPH_ZOOM);
-  const stats = { hits: 0, misses: 0 };
+  const stats = { hits: 0, misses: 0, netMs: 0, decodeMs: 0 };
 
   const tileCoords: { x: number; y: number }[] = [];
   for (let x = range.minX; x <= range.maxX; x++) {
@@ -148,9 +164,21 @@ async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
   console.log(
     `[graph] tile cache: ${stats.hits} hits / ${stats.misses} misses in ${tileCoords.length} tiles`,
   );
+  // Per-tile sums across the ${stats.misses} cache-miss tiles. netMs sums
+  // overlap (16-way parallel fetch pool); decodeMs is single-threaded JS
+  // so its sum ≈ wall-clock cost that a server-side prebuild would remove.
+  console.log(
+    `[graph] per-tile (misses): net=${Math.round(stats.netMs)}ms (sum, parallel) ` +
+    `decode+classify+clip=${Math.round(stats.decodeMs)}ms (sum, serial)`,
+  );
 
+  const tStitch = performance.now();
   const stitched = stitch(segments, (bbox.south + bbox.north) / 2);
+  const stitchMs = performance.now() - tStitch;
+  const tPrune = performance.now();
   const pruned = pruneSmallComponents(stitched, MIN_COMPONENT_EDGES);
+  const pruneMs = performance.now() - tPrune;
+  console.log(`[graph] stitch=${Math.round(stitchMs)}ms prune=${Math.round(pruneMs)}ms`);
 
   return {
     nodes: pruned.nodes,
@@ -167,7 +195,7 @@ async function fetchTileRoads(
   x: number,
   y: number,
   cache: TileCache | null,
-  stats: { hits: number; misses: number },
+  stats: { hits: number; misses: number; netMs: number; decodeMs: number },
 ): Promise<{ segs: RawSegment[]; fromCache: boolean }> {
   if (cache) {
     const cached = await cache.get(z, x, y);
@@ -178,15 +206,21 @@ async function fetchTileRoads(
   }
   stats.misses++;
 
+  const tNet = performance.now();
   const res = await p.getZxy(z, x, y);
+  stats.netMs += performance.now() - tNet;
   if (!res) {
     // Empty result is cached too — saves a 404 round-trip next time.
     return { segs: [], fromCache: false };
   }
 
+  const tDecode = performance.now();
   const tile = new VectorTile(new Pbf(new Uint8Array(res.data)));
   const layer = tile.layers.roads;
-  if (!layer) return { segs: [], fromCache: false };
+  if (!layer) {
+    stats.decodeMs += performance.now() - tDecode;
+    return { segs: [], fromCache: false };
+  }
 
   // Per-tile clip rectangle. MVT features include geometry inside a
   // small buffer past the tile boundary; clipping back to the actual
@@ -224,6 +258,7 @@ async function fetchTileRoads(
     }
   }
 
+  stats.decodeMs += performance.now() - tDecode;
   return { segs, fromCache: false };
 }
 
@@ -286,6 +321,7 @@ function stitch(
   // Cells are also segregated by `level` so bridge-interior vertices
   // don't get matched against street-interior vertices below.
   const grid = new Map<string, number[]>(); // cellKey → canonical node ids
+  const exactKey = new Map<string, number>(); // "lng,lat,level" → id (no-merge mode)
   const nodes: GraphNode[] = [];
 
   // ε² in meters² — the distance check below rescales lng/lat back to
@@ -293,6 +329,19 @@ function stitch(
   const eps2 = EPS_M * EPS_M;
 
   const canonicalId = (lng: number, lat: number, level: number): number => {
+    if (!PROXIMITY_MERGE) {
+      // Exact-coincidence merge only: fuses the duplicate vertices that
+      // shared OSM nodes produce within a tile (identical projection),
+      // but leaves EPS_M-close-but-distinct vertices — and cross-tile
+      // clip points — unmerged, so the raw network is visible.
+      const k = `${lng},${lat},${level}`;
+      const existing = exactKey.get(k);
+      if (existing !== undefined) return existing;
+      const id = nodes.length;
+      nodes.push({ id, lng, lat });
+      exactKey.set(k, id);
+      return id;
+    }
     const cx = Math.floor(lng / epsLng);
     const cy = Math.floor(lat / epsLat);
     for (let dx = -1; dx <= 1; dx++) {
@@ -594,16 +643,6 @@ function pruneSmallComponents(
       droppedEdges++;
       const e = edges[i];
       droppedByKlass.set(e.klass, (droppedByKlass.get(e.klass) ?? 0) + 1);
-      // Spot-log dropped vehicular edges so we can investigate
-      // structural isolation case-by-case. Skip path/service — those
-      // are mostly legitimately disconnected.
-      if (e.klass === 'major' || e.klass === 'minor' || e.klass === 'residential') {
-        const mid = e.coords[Math.floor(e.coords.length / 2)];
-        console.log(
-          `[graph]   dropped ${e.klass}: comp_size=${compSize[edgeComp[i]]} ` +
-          `midpoint=${mid[1].toFixed(6)},${mid[0].toFixed(6)}`,
-        );
-      }
       continue;
     }
     const e = edges[i];

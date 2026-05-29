@@ -15,6 +15,16 @@
 # manifest.json at a stable URL lists every region's current URL — the app
 # fetches the manifest at startup and picks a region by geolocation, so tile
 # refreshes don't require an app redeploy.
+#
+# Runs whole or sharded. With no args it builds every region and writes the
+# manifest. The CI workflow shards it across runners (one region each) by
+# setting ONLY_REGION=<id> EMIT_MANIFEST=0; each shard uploads its PMTiles and
+# writes a manifest fragment, and a final assemble job (assemble-manifest.sh)
+# merges the fragments into manifest.json. Knobs:
+#   ONLY_REGION       build just this region id (default: all in REGIONS_FILE)
+#   EMIT_MANIFEST     0 to skip the manifest (matrix shards); default 1
+#   FRAGMENT_DIR      where per-region manifest fragments are written
+#   DOWNLOAD_THREADS  pmtiles extract parallel range-request threads (default 4)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,6 +33,9 @@ MIN_ZOOM="${MIN_ZOOM:-12}"
 MAX_ZOOM="${MAX_ZOOM:-14}"
 S3_PREFIX="${S3_PREFIX:-s3://alex-knowlton/pictomap/tiles}"
 REGIONS_FILE="${REGIONS_FILE:-tiles/regions.json}"
+DOWNLOAD_THREADS="${DOWNLOAD_THREADS:-4}"
+EMIT_MANIFEST="${EMIT_MANIFEST:-1}"
+ONLY_REGION="${ONLY_REGION:-}"
 MAX_BYTES=32212254720   # 30 * 1024^3 — CloudFront's per-object response cap
 
 yesterday_utc() {
@@ -37,6 +50,11 @@ SOURCE_URL="https://build.protomaps.com/${SOURCE_DATE}.pmtiles"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Per-region manifest fragments land here. mktemp gives an absolute path, so
+# this survives assemble-manifest.sh's own `cd` when a full run hands off to it.
+FRAGMENT_DIR="${FRAGMENT_DIR:-$TMP_DIR/fragments}"
+mkdir -p "$FRAGMENT_DIR"
 
 for cmd in pmtiles aws curl jq; do
   if ! command -v "$cmd" >/dev/null; then
@@ -53,6 +71,17 @@ if [ ! -f "$REGIONS_FILE" ]; then
   exit 1
 fi
 
+# Build every region, or just one (matrix shard) when ONLY_REGION is set.
+if [ -n "$ONLY_REGION" ]; then
+  REGIONS_JSON=$(jq -c --arg id "$ONLY_REGION" '[.[] | select(.id == $id)]' "$REGIONS_FILE")
+  if [ "$(jq 'length' <<<"$REGIONS_JSON")" -eq 0 ]; then
+    echo "ONLY_REGION='$ONLY_REGION' not found in $REGIONS_FILE" >&2
+    exit 1
+  fi
+else
+  REGIONS_JSON=$(jq -c '.' "$REGIONS_FILE")
+fi
+
 if ! curl -sfI "$SOURCE_URL" >/dev/null; then
   echo "Source not reachable — Protomaps rotates daily builds." >&2
   echo "Pick a recent date from https://build.protomaps.com/ and re-run with" >&2
@@ -60,15 +89,16 @@ if ! curl -sfI "$SOURCE_URL" >/dev/null; then
   exit 1
 fi
 
-REGION_COUNT=$(jq 'length' "$REGIONS_FILE")
-echo "Source: $SOURCE_URL"
-echo "Zooms:  z${MIN_ZOOM}-z${MAX_ZOOM}"
-echo "Regions: $REGION_COUNT (from $REGIONS_FILE)"
+REGION_COUNT=$(jq 'length' <<<"$REGIONS_JSON")
+echo "Source:  $SOURCE_URL"
+echo "Zooms:   z${MIN_ZOOM}-z${MAX_ZOOM}"
+echo "Threads: $DOWNLOAD_THREADS"
+echo "Regions: $REGION_COUNT$( [ -n "$ONLY_REGION" ] && echo " (only: $ONLY_REGION)" || echo " (from $REGIONS_FILE)" )"
 echo
 
-# Accumulate per-region entries for the manifest. Each entry merges the region
-# config (id, name, bbox) with the published URL and on-disk size.
-MANIFEST_REGIONS="[]"
+# Each region writes one manifest fragment (region config + filename + size) to
+# FRAGMENT_DIR; the fragments are merged into manifest.json below (full run) or
+# by assemble-manifest.sh in the CI assemble job (matrix shards).
 
 i=0
 while IFS= read -r region; do
@@ -88,6 +118,7 @@ while IFS= read -r region; do
   if ! pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
       --minzoom="$MIN_ZOOM" \
       --maxzoom="$MAX_ZOOM" \
+      --download-threads="$DOWNLOAD_THREADS" \
       --bbox="$BBOX" >"$PMTILES_LOG" 2>&1; then
     cat "$PMTILES_LOG" >&2
     exit 1
@@ -112,37 +143,24 @@ while IFS= read -r region; do
 
   # Manifest stores bare filename so the app resolves tile URLs relative to
   # the manifest URL — works the same in dev (Vite proxy) and prod (same-origin)
-  # without any CORS configuration.
-  MANIFEST_REGIONS=$(jq \
+  # without any CORS configuration. One fragment per region; merged later.
+  jq -n \
     --argjson region "$region" \
     --arg filename "$OUTPUT_NAME" \
     --argjson size "$SIZE_BYTES" \
-    '. + [$region + {filename: $filename, sizeBytes: $size}]' \
-    <<<"$MANIFEST_REGIONS")
+    '$region + {filename: $filename, sizeBytes: $size}' \
+    > "${FRAGMENT_DIR}/${REGION_ID}.json"
 
   echo
-done < <(jq -c '.[]' "$REGIONS_FILE")
+done < <(jq -c '.[]' <<<"$REGIONS_JSON")
 
-# Manifest URL is stable; the app hardcodes it. Short cache (5 min) so tile
-# refreshes propagate without anyone having to invalidate or redeploy.
-MANIFEST_PATH="${TMP_DIR}/manifest.json"
-jq -n \
-  --arg sourceDate "$SOURCE_DATE" \
-  --argjson minZoom "$MIN_ZOOM" \
-  --argjson maxZoom "$MAX_ZOOM" \
-  --argjson regions "$MANIFEST_REGIONS" \
-  '{
-    generatedAt: (now | todateiso8601),
-    sourceDate: $sourceDate,
-    minZoom: $minZoom,
-    maxZoom: $maxZoom,
-    regions: $regions
-  }' \
-  > "$MANIFEST_PATH"
+# Matrix shards run with EMIT_MANIFEST=0 and leave the merge to the assemble
+# job; a full/standalone run writes the manifest itself from its fragments.
+if [ "$EMIT_MANIFEST" = "0" ]; then
+  echo "EMIT_MANIFEST=0 — wrote fragment(s) to $FRAGMENT_DIR, skipping manifest."
+  exit 0
+fi
 
-aws s3 cp "$MANIFEST_PATH" "${S3_PREFIX}/manifest.json" \
-  --content-type application/json \
-  --cache-control "public, max-age=300" \
-  --only-show-errors
-
-echo "Manifest uploaded to ${S3_PREFIX}/manifest.json"
+MIN_ZOOM="$MIN_ZOOM" MAX_ZOOM="$MAX_ZOOM" SOURCE_DATE="$SOURCE_DATE" \
+S3_PREFIX="$S3_PREFIX" REGIONS_FILE="$REGIONS_FILE" FRAGMENT_DIR="$FRAGMENT_DIR" \
+  ./assemble-manifest.sh

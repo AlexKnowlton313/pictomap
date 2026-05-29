@@ -7,6 +7,11 @@
 # Regions are defined in tiles/regions.json. Each must stay under CloudFront's
 # 30GB per-object cap; the script hard-fails if any region exceeds it.
 #
+# Sharded across runners: `setup` resolves the source date + region list once,
+# `build` extracts/uploads one region per runner in parallel (each gets its own
+# full disk, sidestepping the single-runner disk limit) and emits a manifest
+# fragment, and `assemble` merges the fragments into manifest.json.
+#
 # One-time AWS setup:
 #   1. Same OIDC provider as deploy.yml.
 #   2. Create an IAM role assumable by repo:AlexKnowlton313/pictomap:* with
@@ -44,15 +49,60 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # Resolve the source date, zooms, and region matrix ONCE so every shard
+  # agrees (a build straddling UTC midnight must not split across two dates),
+  # and fail fast if the Protomaps build for that date isn't reachable.
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      source_date: ${{ steps.meta.outputs.source_date }}
+      min_zoom: ${{ steps.meta.outputs.min_zoom }}
+      max_zoom: ${{ steps.meta.outputs.max_zoom }}
+      regions: ${{ steps.meta.outputs.regions }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve build metadata
+        id: meta
+        env:
+          MIN_ZOOM: ${{ inputs.min_zoom || '12' }}
+          MAX_ZOOM: ${{ inputs.max_zoom || '14' }}
+          SOURCE_DATE_INPUT: ${{ inputs.source_date }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE="$SOURCE_DATE_INPUT"
+          [ -z "$SOURCE_DATE" ] && SOURCE_DATE="$(date -u -d 'yesterday' +%Y%m%d)"
+          SOURCE_URL="https://build.protomaps.com/${SOURCE_DATE}.pmtiles"
+          if ! curl -sfI "$SOURCE_URL" >/dev/null; then
+            echo "Source not reachable: $SOURCE_URL" >&2
+            echo "Pick a recent date from https://build.protomaps.com/ and re-run with source_date." >&2
+            exit 1
+          fi
+          REGIONS=$(jq -c '[.[].id]' tiles/regions.json)
+          {
+            echo "source_date=$SOURCE_DATE"
+            echo "min_zoom=$MIN_ZOOM"
+            echo "max_zoom=$MAX_ZOOM"
+            echo "regions=$REGIONS"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source $SOURCE_URL OK; regions=$REGIONS"
+
+  # One region per runner, in parallel. fail-fast: false so a single region's
+  # failure doesn't cancel the others (you still see which succeeded); assemble
+  # needs the whole build job to pass, so a failure prevents a partial manifest.
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJson(needs.setup.outputs.regions) }}
     steps:
       - uses: actions/checkout@v4
 
-      # Standard runners ship with ~14GB free of 80GB. Per-region extracts
-      # are smaller than the global build was, but the largest single region
-      # (East Asia + N Eurasia) could still approach the cap, so reclaim disk.
+      # Standard runners ship with ~14GB free of 80GB. A single region's
+      # extract (largest is East Asia + N Eurasia) can approach the 30GB cap,
+      # so reclaim disk.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -78,12 +128,48 @@ jobs:
           role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
           aws-region: us-east-1
 
-      - name: Build & upload
+      - name: Build & upload ${{ matrix.region }}
         env:
-          MIN_ZOOM: ${{ inputs.min_zoom || '12' }}
-          MAX_ZOOM: ${{ inputs.max_zoom || '14' }}
-          SOURCE_DATE: ${{ inputs.source_date }}
-        run: |
-          # Empty SOURCE_DATE means "let the script default to yesterday UTC".
-          [ -z "${SOURCE_DATE:-}" ] && unset SOURCE_DATE
-          ./deploy-tiles.sh
+          ONLY_REGION: ${{ matrix.region }}
+          SOURCE_DATE: ${{ needs.setup.outputs.source_date }}
+          MIN_ZOOM: ${{ needs.setup.outputs.min_zoom }}
+          MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
+          EMIT_MANIFEST: '0'
+          FRAGMENT_DIR: ${{ github.workspace }}/fragments
+          DOWNLOAD_THREADS: '8'
+        run: ./deploy-tiles.sh
+
+      - name: Upload manifest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-fragment-${{ matrix.region }}
+          path: fragments/${{ matrix.region }}.json
+          retention-days: 1
+          if-no-files-found: error
+
+  # Gather every shard's fragment and publish the merged manifest.json.
+  assemble:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: fragments
+          pattern: manifest-fragment-*
+          merge-multiple: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Assemble & upload manifest
+        env:
+          SOURCE_DATE: ${{ needs.setup.outputs.source_date }}
+          MIN_ZOOM: ${{ needs.setup.outputs.min_zoom }}
+          MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
+          FRAGMENT_DIR: ${{ github.workspace }}/fragments
+        run: ./assemble-manifest.sh

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Pictomap is a single-page Svelte 5 + TypeScript + Vite app that turns an uploaded image (silhouette/logo/drawing) into a runnable route. The image is overlaid on a MapLibre map, traced to a polyline, and snapped to nearby roads using a custom in-browser HMM matcher. No backend — everything runs in the browser. `tasks.md` is the canonical design doc and roadmap; consult it before making architectural decisions.
+Pictomap is a single-page Svelte 5 + TypeScript + Vite app that turns an uploaded image (silhouette/logo/drawing) into a runnable route. The image is overlaid on a MapLibre map, traced to a polyline, and snapped to nearby roads using a custom in-browser HMM matcher. No backend — everything runs in the browser. `docs/tasks.md` is the canonical design doc and roadmap; consult it before making architectural decisions.
 
 ## Commands
 
@@ -60,7 +60,7 @@ upload → threshold → boundary trace → RDP simplify → Point[] (pixel spac
 
 ### Why the matcher is custom (don't replace with a hosted API)
 
-Hosted matchers (Mapbox, Stadia, GraphHopper) optimize for noisy GPS trajectories. Pictomap's input isn't a trajectory — it's a shape. The cost function in `matcher.ts` reflects that: emission Gaussian on perpendicular distance, route-vs-input distance term, **shape-preservation term** (heading agreement between consecutive input steps and the matched route), and a runnability penalty (motorways pre-filtered, paths preferred). This is the product differentiator. The tuning knobs at the top of `matcher.ts` (`EMISSION_SIGMA_M`, `SHAPE_WEIGHT`, `ROUTE_DEVIATION_PER_M`, `TRANSITION_CAP_*`) are deliberately first-pass guesses — Task 6e in `tasks.md` is the iteration pass.
+Hosted matchers (Mapbox, Stadia, GraphHopper) optimize for noisy GPS trajectories. Pictomap's input isn't a trajectory — it's a shape. The cost function in `matcher.ts` reflects that: emission Gaussian on perpendicular distance, route-vs-input distance term, **shape-preservation term** (heading agreement between consecutive input steps and the matched route), and a runnability penalty (motorways pre-filtered, paths preferred). This is the product differentiator. The tuning knobs at the top of `matcher.ts` (`EMISSION_SIGMA_M`, `SHAPE_WEIGHT`, `ROUTE_DEVIATION_PER_M`, `TRANSITION_CAP_*`) are deliberately first-pass guesses — Task 6e in `docs/tasks.md` is the iteration pass.
 
 ### Graph build subtleties
 
@@ -98,6 +98,8 @@ Three independent pipelines:
 - **App** (`./deploy.sh`, GitHub Actions `deploy.yml` on push to main): builds and syncs to `s3://alex-knowlton/pictomap/`, invalidates CloudFront. Doesn't bake in tile URLs — the app fetches the manifest at runtime.
 - **Display tiles** (`./deploy-tiles.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL. These drive the **MapLibre basemap** only.
 - **Routing tiles** (`./deploy-routing-tiles.sh`, GitHub Actions `deploy-routing-tiles.yml` weekly): generates a custom roads+paths tileset from raw OSM (Geofabrik extracts → optional `osmium merge` → `tilemaker`) and writes `routing-manifest.json`. These drive the **road graph** — see below.
+
+Tile hosting cost / cheaper-host options (Cloudflare R2, Backblaze B2) are evaluated in [`docs/migration.md`](docs/migration.md).
 
 ### Tiles architecture
 

@@ -3,10 +3,10 @@
  * (<10km); the matcher uses MapLibre's own projection for anything precise.
  */
 
-const METERS_PER_DEG_LAT = 111_320;
+import { METERS_PER_DEG_LAT, metersPerDegLng } from '../geo';
 
 export function degreesLngPerMeter(lat: number): number {
-  return 1 / (METERS_PER_DEG_LAT * Math.cos((lat * Math.PI) / 180));
+  return 1 / metersPerDegLng(lat);
 }
 
 export function degreesLatPerMeter(): number {

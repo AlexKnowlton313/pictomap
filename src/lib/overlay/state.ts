@@ -19,7 +19,7 @@ export function polylinePerimeter(pts: Point[]): number {
   }
   // Treat the contour as closed for sizing — matches what users expect for
   // hearts, letters, etc., even though the matcher leaves it open (see
-  // tasks.md "Closed shapes are returned open").
+  // docs/tasks.md "Closed shapes are returned open").
   sum += Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y);
   return sum;
 }

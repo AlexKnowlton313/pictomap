@@ -1,5 +1,6 @@
 <script lang="ts">
   import { loadImageFile, type LoadedImage } from './load';
+  import { errorMessage } from '../errors';
 
   interface Props {
     onload: (image: LoadedImage) => void;
@@ -19,7 +20,7 @@
       const img = await loadImageFile(file);
       onload(img);
     } catch (err) {
-      error = err instanceof Error ? err.message : 'Could not load image';
+      error = errorMessage(err, 'Could not load image');
     } finally {
       busy = false;
     }

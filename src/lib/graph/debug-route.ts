@@ -11,18 +11,18 @@
  */
 
 import { MinHeap } from './heap';
+import { buildEdgeAdjacency } from './graph-utils';
+import { METERS_PER_DEG_LAT, metersPerDegLng } from '../geo';
 import type { RoadGraph } from './types';
-
-const M_PER_DEG_LAT = 111_320;
 
 /** Nearest graph node to a lng/lat, by flat-earth meters. -1 if empty. */
 export function nearestNode(graph: RoadGraph, lng: number, lat: number): number {
-  const cosLat = Math.cos((lat * Math.PI) / 180);
+  const mPerLng = metersPerDegLng(lat);
   let best = -1;
   let bestD2 = Infinity;
   for (const n of graph.nodes) {
-    const dx = (n.lng - lng) * cosLat * M_PER_DEG_LAT;
-    const dy = (n.lat - lat) * M_PER_DEG_LAT;
+    const dx = (n.lng - lng) * mPerLng;
+    const dy = (n.lat - lat) * METERS_PER_DEG_LAT;
     const d2 = dx * dx + dy * dy;
     if (d2 < bestD2) {
       bestD2 = d2;
@@ -62,13 +62,7 @@ export function routeBetweenPoints(
   const startSnapM = nodeDistM(graph, startNode, a);
   const endSnapM = nodeDistM(graph, endNode, b);
 
-  // nodeId → indices into graph.edges incident on it.
-  const adj: number[][] = Array.from({ length: graph.nodes.length }, () => []);
-  for (let i = 0; i < graph.edges.length; i++) {
-    const e = graph.edges[i];
-    adj[e.a].push(i);
-    adj[e.b].push(i);
-  }
+  const adj = buildEdgeAdjacency(graph.nodes.length, graph.edges);
 
   const dist = new Float64Array(graph.nodes.length).fill(Infinity);
   const prevEdge = new Int32Array(graph.nodes.length).fill(-1);
@@ -124,8 +118,7 @@ export function routeBetweenPoints(
 
 function nodeDistM(graph: RoadGraph, nodeId: number, p: [number, number]): number {
   const n = graph.nodes[nodeId];
-  const cosLat = Math.cos((p[1] * Math.PI) / 180);
-  const dx = (n.lng - p[0]) * cosLat * M_PER_DEG_LAT;
-  const dy = (n.lat - p[1]) * M_PER_DEG_LAT;
+  const dx = (n.lng - p[0]) * metersPerDegLng(p[1]);
+  const dy = (n.lat - p[1]) * METERS_PER_DEG_LAT;
   return Math.hypot(dx, dy);
 }

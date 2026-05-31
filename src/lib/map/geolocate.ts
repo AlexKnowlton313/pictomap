@@ -25,3 +25,11 @@ export async function getCurrentPosition(): Promise<LngLat> {
     );
   });
 }
+
+/** Map a geolocation rejection to a user-facing message. */
+export function geolocationErrorMessage(err: unknown): string {
+  const code = (err as GeolocationPositionError | undefined)?.code;
+  if (code === 1) return 'Location permission denied';
+  if (code === 3) return 'Location request timed out';
+  return 'Could not get location';
+}

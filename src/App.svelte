@@ -8,10 +8,12 @@
   import { projectContourToLngLat } from './lib/overlay/project';
   import { state } from './lib/state.svelte';
   import { graphStore } from './lib/graph/store.svelte';
+  import { errorMessage } from './lib/errors';
   import type { Point } from './lib/image/trace';
 
   /** Debounce window between transform-end and re-match, ms. */
   const SNAP_DEBOUNCE_MS = 300;
+  const MI_PER_KM = 0.621371;
 
   let snapTimer: ReturnType<typeof setTimeout> | null = null;
   /** Generation counter — results from older snaps are discarded. */
@@ -57,7 +59,7 @@
       state.matched = result;
     } catch (err) {
       if (myGen !== snapGen) return;
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errorMessage(err);
       console.error('[snap] failed:', msg);
       state.matched = null;
       state.matchStatus = msg;
@@ -74,6 +76,11 @@
 
   let matchedKm = $derived(state.matched ? state.matched.length / 1000 : null);
 </script>
+
+{#snippet kmMi(km: number)}
+  {km.toFixed(2)} km
+  <span class="muted">· {(km * MI_PER_KM).toFixed(2)} mi</span>
+{/snippet}
 
 <main>
   <Map />
@@ -103,17 +110,13 @@
     <div class="status">
       <div class="row">
         <span class="label">Perimeter</span>
-        <span class="value">
-          {perimeterKm.toFixed(2)} km
-          <span class="muted">· {(perimeterKm * 0.621371).toFixed(2)} mi</span>
-        </span>
+        <span class="value">{@render kmMi(perimeterKm)}</span>
       </div>
       {#if matchedKm !== null && state.matched}
         <div class="row">
           <span class="label">Route</span>
           <span class="value">
-            {matchedKm.toFixed(2)} km
-            <span class="muted">· {(matchedKm * 0.621371).toFixed(2)} mi</span>
+            {@render kmMi(matchedKm)}
             {#if state.matched.closeGap > 5}
               <span class="muted" title="Gap between start and end of matched route">
                 · gap {Math.round(state.matched.closeGap)} m

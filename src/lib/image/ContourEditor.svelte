@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
   import { bitmapToImageData, type LoadedImage } from './load';
   import { extractContour, type ContourResult } from './pipeline';
+  import { errorMessage } from '../errors';
   import type { Point } from './trace';
 
   interface Props {
@@ -36,7 +36,7 @@
         result = r;
         traceError = r ? null : 'No contour found at this threshold';
       } catch (err) {
-        traceError = err instanceof Error ? err.message : 'Tracing failed';
+        traceError = errorMessage(err, 'Tracing failed');
         result = null;
       }
     }, 60);
@@ -82,10 +82,6 @@
       ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
       ctx.fill();
     }
-  });
-
-  onDestroy(() => {
-    // sourceData held by closure; nothing else to release.
   });
 
   function accept(): void {

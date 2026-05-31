@@ -33,6 +33,7 @@
 #   SKIP_UPLOAD     1 to build PMTiles into OUT_DIR without touching S3 (local
 #                   iteration; implies no manifest, and aws creds not required)
 #   OUT_DIR         where SKIP_UPLOAD writes archives (default ./routing-tiles-out)
+#   PROGRESS_SAMPLE echo every Nth download/build log line as progress (default 10; 0 = silent)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -54,6 +55,17 @@ SKIP_UPLOAD="${SKIP_UPLOAD:-0}"
 OUT_DIR="${OUT_DIR:-./routing-tiles-out}"
 MANIFEST_NAME="${MANIFEST_NAME:-routing-manifest.json}"
 MAX_BYTES=32212254720   # 30 * 1024^3 — CloudFront's per-object response cap
+PROGRESS_SAMPLE="${PROGRESS_SAMPLE:-10}"
+
+# Stream a long, chatty command: full output to a log (surfaced on failure),
+# plus every PROGRESS_SAMPLE-th line echoed to the terminal so downloads and
+# tilemaker show progress without their full flood. pipefail (set above) keeps
+# the wrapped command's exit status.
+run_logged() {
+  local log="$1"; shift
+  "$@" 2>&1 | tee "$log" | awk -v n="$PROGRESS_SAMPLE" \
+    'n > 0 && NR % n == 0 { print "      " $0; fflush() }'
+}
 
 # Geofabrik publishes "-latest" extracts, so the build date is just today.
 BUILD_DATE="${BUILD_DATE:-$(date -u +%Y%m%d)}"
@@ -140,9 +152,14 @@ while IFS= read -r region; do
     n=$((n + 1))
     f="${TMP_DIR}/${REGION_ID}-src${n}.osm.pbf"
     echo "    download ${url}"
-    # -s drops curl's progress meter (a new line per chunk on CI's non-TTY
-    # logs over multi-GB extracts); -S keeps real errors visible.
-    curl -fsSL --retry 3 --retry-delay 5 -o "$f" "$url"
+    # curl's per-chunk progress (a new line per chunk once its stderr is a pipe)
+    # floods multi-GB extracts; run_logged samples 1/PROGRESS_SAMPLE of it and
+    # keeps the full log. -S keeps real errors in that log, surfaced on failure.
+    DL_LOG="${TMP_DIR}/download-${REGION_ID}-src${n}.log"
+    if ! run_logged "$DL_LOG" curl -fSL --retry 3 --retry-delay 5 -o "$f" "$url"; then
+      cat "$DL_LOG" >&2
+      exit 1
+    fi
     LOCAL_FILES+=("$f")
   done
 
@@ -159,21 +176,21 @@ while IFS= read -r region; do
   fi
 
   # 3. tilemaker -> PMTiles. --store keeps the node index on disk so large
-  #    continents stay within the RAM budget. Chatty on stderr; capture and
-  #    only surface on failure (mirrors deploy-tiles.sh).
+  #    continents stay within the RAM budget. Chatty on stderr; run_logged
+  #    samples it to the terminal and keeps the full log to surface on failure.
   OUTPUT_NAME="pictomap-routing-${REGION_ID}-${BUILD_DATE}-z${ZOOM}.pmtiles"
   OUTPUT_PATH="${TMP_DIR}/${OUTPUT_NAME}"
   STORE_DIR="${TMP_DIR}/store-${REGION_ID}"
   rm -rf "$STORE_DIR"
   TM_LOG="${TMP_DIR}/tilemaker-${REGION_ID}.log"
-  echo "    tilemaker -> ${OUTPUT_NAME}"
-  if ! "$TILEMAKER" \
+  echo "    tilemaker -> ${OUTPUT_NAME}…"
+  if ! run_logged "$TM_LOG" "$TILEMAKER" \
       --input "$INPUT" \
       --output "$OUTPUT_PATH" \
       --config "$TILEMAKER_CONFIG" \
       --process "$TILEMAKER_PROCESS" \
       --bbox "$BBOX" \
-      --store "$STORE_DIR" >"$TM_LOG" 2>&1; then
+      --store "$STORE_DIR"; then
     cat "$TM_LOG" >&2
     exit 1
   fi

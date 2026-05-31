@@ -25,6 +25,7 @@
 #   EMIT_MANIFEST     0 to skip the manifest (matrix shards); default 1
 #   FRAGMENT_DIR      where per-region manifest fragments are written
 #   DOWNLOAD_THREADS  pmtiles extract parallel range-request threads (default 4)
+#   PROGRESS_SAMPLE   echo every Nth extract log line as progress (default 10; 0 = silent)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -37,6 +38,17 @@ DOWNLOAD_THREADS="${DOWNLOAD_THREADS:-4}"
 EMIT_MANIFEST="${EMIT_MANIFEST:-1}"
 ONLY_REGION="${ONLY_REGION:-}"
 MAX_BYTES=32212254720   # 30 * 1024^3 — CloudFront's per-object response cap
+PROGRESS_SAMPLE="${PROGRESS_SAMPLE:-10}"
+
+# Run a long, chatty command with its full output saved to a log file while
+# echoing every PROGRESS_SAMPLE-th line to the terminal — enough to watch a
+# download/extract move without the per-tile flood. Callers cat the log on
+# failure; pipefail (set above) makes this return the wrapped command's status.
+run_logged() {
+  local log="$1"; shift
+  "$@" 2>&1 | tee "$log" | awk -v n="$PROGRESS_SAMPLE" \
+    'n > 0 && NR % n == 0 { print "      " $0; fflush() }'
+}
 
 yesterday_utc() {
   if date -u -v-1d +%Y%m%d >/dev/null 2>&1; then
@@ -113,13 +125,15 @@ while IFS= read -r region; do
   echo "[${i}/${REGION_COUNT}] ${REGION_NAME} (${BBOX})"
 
   # pmtiles extract is chatty (progress bars + per-tile counts on stderr).
-  # Capture to a log and only surface it if the command fails.
+  # run_logged keeps the full output in a log (surfaced on failure) and streams
+  # a 1/PROGRESS_SAMPLE sample to the terminal so the extract shows progress.
+  echo "    downloading + extracting z${MIN_ZOOM}-z${MAX_ZOOM} (range requests, ${DOWNLOAD_THREADS} threads)…"
   PMTILES_LOG="${TMP_DIR}/pmtiles-${REGION_ID}.log"
-  if ! pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
+  if ! run_logged "$PMTILES_LOG" pmtiles extract "$SOURCE_URL" "$OUTPUT_PATH" \
       --minzoom="$MIN_ZOOM" \
       --maxzoom="$MAX_ZOOM" \
       --download-threads="$DOWNLOAD_THREADS" \
-      --bbox="$BBOX" >"$PMTILES_LOG" 2>&1; then
+      --bbox="$BBOX"; then
     cat "$PMTILES_LOG" >&2
     exit 1
   fi

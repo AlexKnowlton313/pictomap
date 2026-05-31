@@ -2,7 +2,7 @@
 
 Turn an uploaded image (silhouette, logo, drawing) into a runnable route. Drag the shape over the map at your location; we trace it, snap it to nearby roads/trails using a custom shape-aware matcher, and export GPX.
 
-See [`tasks.md`](./tasks.md) for the full architecture, design decisions, and roadmap.
+See [`docs/tasks.md`](./docs/tasks.md) for the full architecture, design decisions, and roadmap.
 
 ## Quick start
 

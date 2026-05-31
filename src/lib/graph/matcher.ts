@@ -10,6 +10,7 @@
  */
 
 import { MinHeap } from './heap';
+import { buildEdgeAdjacency } from './graph-utils';
 import { frame, fromLocal, toLocal, type LocalFrame } from './projection';
 import {
   angleDiff,
@@ -130,11 +131,7 @@ export class Matcher {
       this.edgeKlass[i] = e.klass;
     }
 
-    this.adj = Array.from({ length: graph.nodes.length }, () => []);
-    for (let i = 0; i < n; i++) {
-      this.adj[this.edgeA[i]].push(i);
-      this.adj[this.edgeB[i]].push(i);
-    }
+    this.adj = buildEdgeAdjacency(graph.nodes.length, graph.edges);
   }
 
   match(contourLngLat: [number, number][]): MatchResult {

@@ -106,7 +106,7 @@ For v1, ship one metro area. Multi-region is a v2 deployment concern.
 - Memory footprint <100MB for a 5km box
 
 **GO:** continue to Tasks 1-8 with the matcher as a known-shape engineering problem
-**NO-GO:** fall back to a hosted matcher (Stadia / Mapbox), revisit `tasks.md`
+**NO-GO:** fall back to a hosted matcher (Stadia / Mapbox), revisit `docs/tasks.md`
 
 ### 1. Scaffold Svelte + Vite + TS project
 Initialize in current directory. Configure `vite.config.ts` (HTTPS dev flag, Web Worker support), `tsconfig.json`, `svelte.config.js`, `.gitignore`, `.env.example` (`VITE_PMTILES_URL`, `VITE_SENTRY_DSN`).

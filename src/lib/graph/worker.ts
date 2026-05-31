@@ -4,8 +4,11 @@ import { PMTiles } from 'pmtiles';
 import { VectorTile } from '@mapbox/vector-tile';
 import Pbf from 'pbf';
 import { classifyRoad, isRunnable } from './highway';
+import { buildEdgeAdjacency } from './graph-utils';
 import { Matcher } from './matcher';
 import { TileCache } from './tile-cache';
+import { METERS_PER_DEG_LAT } from '../geo';
+import { errorMessage } from '../errors';
 import {
   GRAPH_ZOOM,
   clipPolylineToBBox,
@@ -75,7 +78,7 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
     reply({
       type: 'error',
       reqId: req.reqId,
-      message: err instanceof Error ? err.message : String(err),
+      message: errorMessage(err),
     });
   }
 };
@@ -316,7 +319,8 @@ function stitch(
   // km at low zoom, so picking a corner vertex would bias the lng scale
   // toward one side of the graph.
   const EPS_M = 1;
-  const M_PER_DEG_LAT = 111_320;
+  // Local alias keeps the hot stitch math terse; value is shared app-wide.
+  const M_PER_DEG_LAT = METERS_PER_DEG_LAT;
   const epsLat = EPS_M / M_PER_DEG_LAT;
   const epsLng = EPS_M / (M_PER_DEG_LAT * Math.cos((refLat * Math.PI) / 180));
 
@@ -600,11 +604,7 @@ function pruneSmallComponents(
   const { nodes, edges } = graph;
   if (edges.length === 0) return graph;
 
-  const adj: number[][] = Array.from({ length: nodes.length }, () => []);
-  for (let i = 0; i < edges.length; i++) {
-    adj[edges[i].a].push(i);
-    adj[edges[i].b].push(i);
-  }
+  const adj = buildEdgeAdjacency(nodes.length, edges);
 
   // DFS each unvisited edge (queue.pop is LIFO); tag every edge in the
   // same component. Either traversal order would give the same labels.

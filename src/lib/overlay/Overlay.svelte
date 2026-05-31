@@ -12,7 +12,7 @@
     contour: Point[];
     overlay: OverlayState;
     onchange: (next: OverlayState) => void;
-    /** Fires once on drag end. Reserved for the debounced matcher re-run (Task 6d). */
+    /** Fires once on drag end; App.svelte debounces it into a re-snap. */
     onchangeend?: () => void;
   }
 

@@ -6,7 +6,7 @@
  * is cheap. Distortion is <0.1% at the 5km scale we operate on.
  */
 
-const M_PER_DEG_LAT = 111_320;
+import { METERS_PER_DEG_LAT, metersPerDegLng } from '../geo';
 
 export interface LocalFrame {
   refLng: number;
@@ -18,14 +18,14 @@ export function frame(refLng: number, refLat: number): LocalFrame {
   return {
     refLng,
     refLat,
-    mPerDegLng: M_PER_DEG_LAT * Math.cos((refLat * Math.PI) / 180),
+    mPerDegLng: metersPerDegLng(refLat),
   };
 }
 
 export function toLocal(f: LocalFrame, lng: number, lat: number): [number, number] {
-  return [(lng - f.refLng) * f.mPerDegLng, (lat - f.refLat) * M_PER_DEG_LAT];
+  return [(lng - f.refLng) * f.mPerDegLng, (lat - f.refLat) * METERS_PER_DEG_LAT];
 }
 
 export function fromLocal(f: LocalFrame, x: number, y: number): [number, number] {
-  return [f.refLng + x / f.mPerDegLng, f.refLat + y / M_PER_DEG_LAT];
+  return [f.refLng + x / f.mPerDegLng, f.refLat + y / METERS_PER_DEG_LAT];
 }

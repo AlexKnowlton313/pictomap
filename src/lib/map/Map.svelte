@@ -10,8 +10,10 @@
     FALLBACK_ZOOM,
     LOCATED_ZOOM,
     getCurrentPosition,
+    geolocationErrorMessage,
     type LngLat,
   } from './geolocate';
+  import { errorMessage } from '../errors';
   import { GraphService } from '../graph/service';
   import { graphStore } from '../graph/store.svelte';
   import {
@@ -86,6 +88,45 @@
   const DPTS_SOURCE_ID = 'pictomap-debug-route-pts';
   const DPTS_LAYER_ID = 'pictomap-debug-route-pts-circle';
 
+  /** Zoom-interpolated width shared by the matched-route and debug-route lines. */
+  const ROUTE_LINE_WIDTH: maplibregl.ExpressionSpecification = [
+    'interpolate', ['linear'], ['zoom'], 12, 2.5, 16, 5, 19, 8,
+  ];
+
+  /**
+   * Add a GeoJSON source + layer, or just update the source data if they
+   * already exist. Collapses the repeated "getSource → setData else
+   * addSource+addLayer" dance every debug/route overlay was duplicating.
+   */
+  function upsertGeoJSON(
+    sourceId: string,
+    layerId: string,
+    data: GeoJSON.FeatureCollection,
+    spec: Omit<maplibregl.LayerSpecification, 'id' | 'source'>,
+  ): void {
+    if (!map) return;
+    const existing = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
+    if (existing) {
+      existing.setData(data);
+      return;
+    }
+    map.addSource(sourceId, { type: 'geojson', data });
+    map.addLayer({ id: layerId, source: sourceId, ...spec } as maplibregl.LayerSpecification);
+  }
+
+  /** A FeatureCollection holding a single LineString, or empty for <2 coords. */
+  function lineFeatureCollection(
+    coords: [number, number][] | null,
+  ): GeoJSON.FeatureCollection {
+    return {
+      type: 'FeatureCollection',
+      features:
+        coords && coords.length >= 2
+          ? [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } }]
+          : [],
+    };
+  }
+
   function showUserMarker(pos: LngLat): void {
     if (!map) return;
     if (!userMarker) {
@@ -115,10 +156,7 @@
       showUserMarker(pos);
       map.flyTo({ center: [pos.lng, pos.lat], zoom: LOCATED_ZOOM, essential: true });
     } catch (err) {
-      const code = (err as GeolocationPositionError | undefined)?.code;
-      if (code === 1) geoError = 'Location permission denied';
-      else if (code === 3) geoError = 'Location request timed out';
-      else geoError = 'Could not get location';
+      geoError = geolocationErrorMessage(err);
     } finally {
       locating = false;
     }
@@ -136,20 +174,8 @@
   }
 
   function renderGraph(g: RoadGraph): void {
-    if (!map) return;
-    const data = graphToGeoJSON(g);
-    const existing = map.getSource(GRAPH_SOURCE_ID) as
-      | maplibregl.GeoJSONSource
-      | undefined;
-    if (existing) {
-      existing.setData(data);
-      return;
-    }
-    map.addSource(GRAPH_SOURCE_ID, { type: 'geojson', data });
-    map.addLayer({
-      id: GRAPH_LAYER_ID,
+    upsertGeoJSON(GRAPH_SOURCE_ID, GRAPH_LAYER_ID, graphToGeoJSON(g), {
       type: 'line',
-      source: GRAPH_SOURCE_ID,
       layout: {
         'line-cap': 'round',
         'line-join': 'round',
@@ -167,14 +193,7 @@
           'service', '#a78bfa',
           /* other */ '#cbd5e1',
         ],
-        'line-width': [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          12, 0.4,
-          16, 2.2,
-          19, 5,
-        ],
+        'line-width': ['interpolate', ['linear'], ['zoom'], 12, 0.4, 16, 2.2, 19, 5],
         'line-opacity': 0.85,
       },
     });
@@ -222,18 +241,8 @@
   }
 
   function renderTiles(bbox: BBox): void {
-    if (!map) return;
-    const data = tileGridGeoJSON(bbox);
-    const existing = map.getSource(TILE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-    if (existing) {
-      existing.setData(data);
-      return;
-    }
-    map.addSource(TILE_SOURCE_ID, { type: 'geojson', data });
-    map.addLayer({
-      id: TILE_LAYER_ID,
+    upsertGeoJSON(TILE_SOURCE_ID, TILE_LAYER_ID, tileGridGeoJSON(bbox), {
       type: 'line',
-      source: TILE_SOURCE_ID,
       layout: { visibility: showTiles ? 'visible' : 'none' },
       paint: {
         'line-color': '#22d3ee',
@@ -257,7 +266,6 @@
   // absurd detour) means the two points sit in different components.
 
   function renderDebugPoints(pts: [number, number][]): void {
-    if (!map) return;
     const data: GeoJSON.FeatureCollection = {
       type: 'FeatureCollection',
       features: pts.map((p, i) => ({
@@ -266,16 +274,8 @@
         geometry: { type: 'Point', coordinates: p },
       })),
     };
-    const existing = map.getSource(DPTS_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-    if (existing) {
-      existing.setData(data);
-      return;
-    }
-    map.addSource(DPTS_SOURCE_ID, { type: 'geojson', data });
-    map.addLayer({
-      id: DPTS_LAYER_ID,
+    upsertGeoJSON(DPTS_SOURCE_ID, DPTS_LAYER_ID, data, {
       type: 'circle',
-      source: DPTS_SOURCE_ID,
       paint: {
         'circle-radius': 6,
         'circle-color': ['match', ['get', 'role'], 'start', '#22c55e', /* end */ '#ef4444'],
@@ -286,27 +286,12 @@
   }
 
   function renderDebugRoute(coords: [number, number][] | null): void {
-    if (!map) return;
-    const data: GeoJSON.FeatureCollection = {
-      type: 'FeatureCollection',
-      features: coords && coords.length >= 2
-        ? [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } }]
-        : [],
-    };
-    const existing = map.getSource(DROUTE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-    if (existing) {
-      existing.setData(data);
-      return;
-    }
-    map.addSource(DROUTE_SOURCE_ID, { type: 'geojson', data });
-    map.addLayer({
-      id: DROUTE_LAYER_ID,
+    upsertGeoJSON(DROUTE_SOURCE_ID, DROUTE_LAYER_ID, lineFeatureCollection(coords), {
       type: 'line',
-      source: DROUTE_SOURCE_ID,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
       paint: {
         'line-color': '#e879f9',
-        'line-width': ['interpolate', ['linear'], ['zoom'], 12, 2.5, 16, 5, 19, 8],
+        'line-width': ROUTE_LINE_WIDTH,
         'line-opacity': 0.95,
       },
     });
@@ -409,7 +394,7 @@
       renderGraph(graph);
       renderTiles(graph.bbox);
     } catch (err) {
-      graphStore.error = err instanceof Error ? err.message : String(err);
+      graphStore.error = errorMessage(err);
     } finally {
       buildInFlight = false;
       graphStore.building = false;
@@ -421,29 +406,12 @@
   }
 
   function renderRoute(coords: [number, number][] | null): void {
-    if (!map) return;
-    const data: GeoJSON.FeatureCollection = {
-      type: 'FeatureCollection',
-      features: coords && coords.length >= 2
-        ? [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } }]
-        : [],
-    };
-    const existing = map.getSource(ROUTE_SOURCE_ID) as
-      | maplibregl.GeoJSONSource
-      | undefined;
-    if (existing) {
-      existing.setData(data);
-      return;
-    }
-    map.addSource(ROUTE_SOURCE_ID, { type: 'geojson', data });
-    map.addLayer({
-      id: ROUTE_LAYER_ID,
+    upsertGeoJSON(ROUTE_SOURCE_ID, ROUTE_LAYER_ID, lineFeatureCollection(coords), {
       type: 'line',
-      source: ROUTE_SOURCE_ID,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
       paint: {
         'line-color': '#ff6a3d',
-        'line-width': ['interpolate', ['linear'], ['zoom'], 12, 2.5, 16, 5, 19, 8],
+        'line-width': ROUTE_LINE_WIDTH,
         'line-opacity': 0.95,
       },
     });
@@ -540,10 +508,7 @@
     try {
       return { location: await getCurrentPosition(), error: null };
     } catch (err) {
-      const code = (err as GeolocationPositionError | undefined)?.code;
-      if (code === 1) return { location: null, error: 'Location permission denied' };
-      if (code === 3) return { location: null, error: 'Location request timed out' };
-      return { location: null, error: 'Could not get location' };
+      return { location: null, error: geolocationErrorMessage(err) };
     }
   }
 
@@ -570,7 +535,7 @@
       const graphSource = resolveGraphSource(manifest, routingManifest, region);
       initMap(region, graphSource.url, graphSource.zoom, initialLocation, located);
     } catch (err) {
-      bootError = err instanceof Error ? err.message : String(err);
+      bootError = errorMessage(err);
     } finally {
       booting = false;
     }

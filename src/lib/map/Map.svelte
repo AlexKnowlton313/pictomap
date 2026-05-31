@@ -14,8 +14,15 @@
   } from './geolocate';
   import { GraphService } from '../graph/service';
   import { graphStore } from '../graph/store.svelte';
-  import { bboxContains, expandBBox } from '../graph/tile-math';
+  import {
+    bboxContains,
+    expandBBox,
+    tileBounds,
+    tilesCoveringBBox,
+    GRAPH_ZOOM,
+  } from '../graph/tile-math';
   import type { BBox, RoadGraph } from '../graph/types';
+  import { routeBetweenPoints } from '../graph/debug-route';
   import { state as appState } from '../state.svelte';
   import {
     DEFAULT_MANIFEST_URL,
@@ -37,6 +44,11 @@
   let currentRegion = $state<ManifestRegion | null>(null);
   let outOfRegion = $state(false);
   let showGraph = $state(false);
+  let showTiles = $state(false);
+  let routeMode = $state(false);
+  /** Raw debug-route clicks (lng/lat); holds 0–2 points. */
+  let routePts = $state<[number, number][]>([]);
+  let routeInfo = $state<string | null>(null);
 
   const MANIFEST_URL =
     import.meta.env.VITE_TILES_MANIFEST_URL || DEFAULT_MANIFEST_URL;
@@ -59,6 +71,12 @@
   const GRAPH_LAYER_ID = 'pictomap-debug-graph-line';
   const ROUTE_SOURCE_ID = 'pictomap-route';
   const ROUTE_LAYER_ID = 'pictomap-route-line';
+  const TILE_SOURCE_ID = 'pictomap-debug-tiles';
+  const TILE_LAYER_ID = 'pictomap-debug-tiles-line';
+  const DROUTE_SOURCE_ID = 'pictomap-debug-route';
+  const DROUTE_LAYER_ID = 'pictomap-debug-route-line';
+  const DPTS_SOURCE_ID = 'pictomap-debug-route-pts';
+  const DPTS_LAYER_ID = 'pictomap-debug-route-pts-circle';
 
   function showUserMarker(pos: LngLat): void {
     if (!map) return;
@@ -164,6 +182,169 @@
     );
   }
 
+  // --- Debug: z14 tile-boundary overlay ---
+  //
+  // Draws the exact tile grid the graph was built from, so road gaps can
+  // be checked against tile seams: a gap landing on a seam points at a
+  // cross-tile clip/stitch failure rather than missing OSM data.
+
+  function tileGridGeoJSON(bbox: BBox): GeoJSON.FeatureCollection {
+    const range = tilesCoveringBBox(bbox, GRAPH_ZOOM);
+    const features: GeoJSON.Feature[] = [];
+    for (let x = range.minX; x <= range.maxX; x++) {
+      for (let y = range.minY; y <= range.maxY; y++) {
+        const b = tileBounds(x, y, GRAPH_ZOOM);
+        features.push({
+          type: 'Feature',
+          properties: { tile: `${GRAPH_ZOOM}/${x}/${y}` },
+          geometry: {
+            type: 'LineString',
+            coordinates: [
+              [b.west, b.north],
+              [b.east, b.north],
+              [b.east, b.south],
+              [b.west, b.south],
+              [b.west, b.north],
+            ],
+          },
+        });
+      }
+    }
+    return { type: 'FeatureCollection', features };
+  }
+
+  function renderTiles(bbox: BBox): void {
+    if (!map) return;
+    const data = tileGridGeoJSON(bbox);
+    const existing = map.getSource(TILE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    if (existing) {
+      existing.setData(data);
+      return;
+    }
+    map.addSource(TILE_SOURCE_ID, { type: 'geojson', data });
+    map.addLayer({
+      id: TILE_LAYER_ID,
+      type: 'line',
+      source: TILE_SOURCE_ID,
+      layout: { visibility: showTiles ? 'visible' : 'none' },
+      paint: {
+        'line-color': '#22d3ee',
+        'line-width': 1.5,
+        'line-opacity': 0.7,
+        'line-dasharray': [4, 3],
+      },
+    });
+  }
+
+  function toggleTiles(): void {
+    showTiles = !showTiles;
+    if (!map || !map.getLayer(TILE_LAYER_ID)) return;
+    map.setLayoutProperty(TILE_LAYER_ID, 'visibility', showTiles ? 'visible' : 'none');
+  }
+
+  // --- Debug: two-point route probe ---
+  //
+  // Click a start then an end; we snap each to the nearest graph node and
+  // draw the shortest node-network path between them. A null result (or an
+  // absurd detour) means the two points sit in different components.
+
+  function renderDebugPoints(pts: [number, number][]): void {
+    if (!map) return;
+    const data: GeoJSON.FeatureCollection = {
+      type: 'FeatureCollection',
+      features: pts.map((p, i) => ({
+        type: 'Feature',
+        properties: { role: i === 0 ? 'start' : 'end' },
+        geometry: { type: 'Point', coordinates: p },
+      })),
+    };
+    const existing = map.getSource(DPTS_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    if (existing) {
+      existing.setData(data);
+      return;
+    }
+    map.addSource(DPTS_SOURCE_ID, { type: 'geojson', data });
+    map.addLayer({
+      id: DPTS_LAYER_ID,
+      type: 'circle',
+      source: DPTS_SOURCE_ID,
+      paint: {
+        'circle-radius': 6,
+        'circle-color': ['match', ['get', 'role'], 'start', '#22c55e', /* end */ '#ef4444'],
+        'circle-stroke-color': '#ffffff',
+        'circle-stroke-width': 2,
+      },
+    });
+  }
+
+  function renderDebugRoute(coords: [number, number][] | null): void {
+    if (!map) return;
+    const data: GeoJSON.FeatureCollection = {
+      type: 'FeatureCollection',
+      features: coords && coords.length >= 2
+        ? [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } }]
+        : [],
+    };
+    const existing = map.getSource(DROUTE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    if (existing) {
+      existing.setData(data);
+      return;
+    }
+    map.addSource(DROUTE_SOURCE_ID, { type: 'geojson', data });
+    map.addLayer({
+      id: DROUTE_LAYER_ID,
+      type: 'line',
+      source: DROUTE_SOURCE_ID,
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: {
+        'line-color': '#e879f9',
+        'line-width': ['interpolate', ['linear'], ['zoom'], 12, 2.5, 16, 5, 19, 8],
+        'line-opacity': 0.95,
+      },
+    });
+  }
+
+  function clearDebugRoute(): void {
+    routePts = [];
+    routeInfo = null;
+    renderDebugRoute(null);
+    renderDebugPoints([]);
+  }
+
+  function onDebugClick(lngLat: maplibregl.LngLat): void {
+    const click: [number, number] = [lngLat.lng, lngLat.lat];
+    // A click after a completed pair starts a fresh probe.
+    routePts = routePts.length >= 2 ? [click] : [...routePts, click];
+    renderDebugPoints(routePts);
+
+    if (routePts.length < 2) {
+      routeInfo = 'Click an end point…';
+      renderDebugRoute(null);
+      return;
+    }
+    const g = graphStore.graph;
+    if (!g) {
+      routeInfo = 'No graph built yet';
+      return;
+    }
+    const r = routeBetweenPoints(g, routePts[0], routePts[1]);
+    if (!r) {
+      routeInfo = 'No path — points are in different components';
+      renderDebugRoute(null);
+      return;
+    }
+    renderDebugRoute(r.coords);
+    routeInfo =
+      `${Math.round(r.lengthM)} m · snap ${Math.round(r.startSnapM)}/${Math.round(r.endSnapM)} m`;
+  }
+
+  function toggleRouteMode(): void {
+    routeMode = !routeMode;
+    if (map) map.getCanvas().style.cursor = routeMode ? 'crosshair' : '';
+    if (routeMode) routeInfo = 'Click a start point…';
+    else clearDebugRoute();
+  }
+
   /**
    * Build the graph for the current viewport plus a buffer. Skips work
    * when the existing graph already covers the buffered viewport.
@@ -218,6 +399,7 @@
       const graph = await svc.buildGraph(needed);
       graphStore.graph = graph;
       renderGraph(graph);
+      renderTiles(graph.bbox);
     } catch (err) {
       graphStore.error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -293,6 +475,11 @@
     // Track viewport pans: rebuild the graph when the visible bbox
     // (plus buffer) no longer fits inside the previously-built one.
     map.on('moveend', () => scheduleRebuild());
+
+    // Debug route probe: in route mode, clicks drop start/end points.
+    map.on('click', (e) => {
+      if (routeMode) onDebugClick(e.lngLat);
+    });
 
     graphStore.service = new GraphService(pmtilesUrl);
 
@@ -384,6 +571,21 @@
   >
     {showGraph ? 'Hide' : 'Show'} graph
   </button>
+  <button
+    onclick={toggleTiles}
+    disabled={!graphStore.graph}
+    title="Toggle z14 tile boundaries — check whether road gaps fall on tile seams"
+  >
+    {showTiles ? 'Hide' : 'Show'} tiles
+  </button>
+  <button
+    onclick={toggleRouteMode}
+    disabled={!graphStore.graph}
+    class:active={routeMode}
+    title="Route probe: click two points to route between them over the node network"
+  >
+    {routeMode ? 'Routing…' : 'Route probe'}
+  </button>
   {#if currentRegion}
     <span class="muted" title="Active tile region">
       {currentRegion.name}
@@ -401,6 +603,9 @@
       {graphStore.graph.edges.length}e · {graphStore.graph.nodes.length}n ·
       {graphStore.graph.tileCount}t · {graphStore.graph.buildMs}ms
     </span>
+  {/if}
+  {#if routeMode && routeInfo}
+    <span class="muted" role="status">{routeInfo}</span>
   {/if}
   {#if geoError}
     <span class="err" role="alert">{geoError}</span>
@@ -431,6 +636,11 @@
     -webkit-backdrop-filter: blur(8px);
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
     z-index: 10;
+  }
+
+  button.active {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .coords {

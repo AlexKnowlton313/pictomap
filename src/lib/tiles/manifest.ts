@@ -27,10 +27,26 @@ export interface TileManifest {
 
 export const DEFAULT_MANIFEST_URL = '/tiles/manifest.json';
 
+/**
+ * Routing tileset manifest — same shape as the display manifest, listing the
+ * custom roads+paths PMTiles (tiles/routing/, published by
+ * deploy-routing-tiles.sh) that the graph worker builds the road graph from.
+ * Published independently of the display manifest at its own stable URL.
+ */
+export const DEFAULT_ROUTING_MANIFEST_URL = '/tiles/routing-manifest.json';
+
 export async function fetchManifest(url: string): Promise<TileManifest> {
   const res = await fetch(url, { cache: 'default' });
   if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
   return (await res.json()) as TileManifest;
+}
+
+/** Look up a region by id (used to pair a display region with its routing tiles). */
+export function findRegionById(
+  manifest: TileManifest,
+  id: string,
+): ManifestRegion | undefined {
+  return manifest.regions.find((r) => r.id === id);
 }
 
 /**

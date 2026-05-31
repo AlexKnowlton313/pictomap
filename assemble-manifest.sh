@@ -24,6 +24,9 @@ S3_PREFIX="${S3_PREFIX:-s3://alex-knowlton/pictomap/tiles}"
 REGIONS_FILE="${REGIONS_FILE:-tiles/regions.json}"
 FRAGMENT_DIR="${FRAGMENT_DIR:?FRAGMENT_DIR is required}"
 SOURCE_DATE="${SOURCE_DATE:?SOURCE_DATE is required}"
+# Published manifest filename. The display pipeline writes manifest.json; the
+# routing pipeline reuses this same script with MANIFEST_NAME=routing-manifest.json.
+MANIFEST_NAME="${MANIFEST_NAME:-manifest.json}"
 
 for cmd in aws jq; do
   if ! command -v "$cmd" >/dev/null; then
@@ -69,9 +72,9 @@ jq -n \
   }' \
   > "$MANIFEST_PATH"
 
-aws s3 cp "$MANIFEST_PATH" "${S3_PREFIX}/manifest.json" \
+aws s3 cp "$MANIFEST_PATH" "${S3_PREFIX}/${MANIFEST_NAME}" \
   --content-type application/json \
   --cache-control "public, max-age=300" \
   --only-show-errors
 
-echo "Manifest uploaded to ${S3_PREFIX}/manifest.json ($(jq '.regions | length' "$MANIFEST_PATH") regions)"
+echo "Manifest uploaded to ${S3_PREFIX}/${MANIFEST_NAME} ($(jq '.regions | length' "$MANIFEST_PATH") regions)"

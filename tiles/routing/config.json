@@ -1,0 +1,19 @@
+{
+  "layers": {
+    "roads": {
+      "minzoom": 13,
+      "maxzoom": 13
+    }
+  },
+  "settings": {
+    "minzoom": 13,
+    "maxzoom": 13,
+    "basezoom": 13,
+    "high_resolution": true,
+    "include_ids": false,
+    "compress": "gzip",
+    "name": "Pictomap routing",
+    "version": "1.0.0",
+    "description": "Runnable road + pedestrian network for Pictomap's in-browser HMM matcher. Single zoom (z13) at high-resolution extent ~= z14 ground precision."
+  }
+}

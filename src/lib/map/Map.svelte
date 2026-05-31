@@ -26,11 +26,14 @@
   import { state as appState } from '../state.svelte';
   import {
     DEFAULT_MANIFEST_URL,
+    DEFAULT_ROUTING_MANIFEST_URL,
     fetchManifest,
+    findRegionById,
     isInRegion,
     resolveRegionUrl,
     selectRegion,
     type ManifestRegion,
+    type TileManifest,
   } from '../tiles/manifest';
 
   let container: HTMLDivElement;
@@ -49,9 +52,14 @@
   /** Raw debug-route clicks (lng/lat); holds 0–2 points. */
   let routePts = $state<[number, number][]>([]);
   let routeInfo = $state<string | null>(null);
+  /** Zoom of the tileset the graph is built from (routing maxZoom, or display
+   *  maxZoom on fallback). Set at boot; drives the tile-boundary debug overlay. */
+  let graphTileZoom = GRAPH_ZOOM;
 
   const MANIFEST_URL =
     import.meta.env.VITE_TILES_MANIFEST_URL || DEFAULT_MANIFEST_URL;
+  const ROUTING_MANIFEST_URL =
+    import.meta.env.VITE_ROUTING_MANIFEST_URL || DEFAULT_ROUTING_MANIFEST_URL;
 
   /**
    * Extra meters kept around the visible viewport in the graph bbox.
@@ -182,21 +190,21 @@
     );
   }
 
-  // --- Debug: z14 tile-boundary overlay ---
+  // --- Debug: graph tile-boundary overlay (GRAPH_ZOOM) ---
   //
   // Draws the exact tile grid the graph was built from, so road gaps can
   // be checked against tile seams: a gap landing on a seam points at a
   // cross-tile clip/stitch failure rather than missing OSM data.
 
   function tileGridGeoJSON(bbox: BBox): GeoJSON.FeatureCollection {
-    const range = tilesCoveringBBox(bbox, GRAPH_ZOOM);
+    const range = tilesCoveringBBox(bbox, graphTileZoom);
     const features: GeoJSON.Feature[] = [];
     for (let x = range.minX; x <= range.maxX; x++) {
       for (let y = range.minY; y <= range.maxY; y++) {
-        const b = tileBounds(x, y, GRAPH_ZOOM);
+        const b = tileBounds(x, y, graphTileZoom);
         features.push({
           type: 'Feature',
-          properties: { tile: `${GRAPH_ZOOM}/${x}/${y}` },
+          properties: { tile: `${graphTileZoom}/${x}/${y}` },
           geometry: {
             type: 'LineString',
             coordinates: [
@@ -445,8 +453,48 @@
     renderRoute(appState.matched ? appState.matched.coords : null);
   });
 
-  function initMap(region: ManifestRegion, center: LngLat, located: boolean): void {
+  /**
+   * Pick the tileset the graph builds from. Routing tiles drive the graph;
+   * display tiles drive the basemap. They live in separate manifests so the
+   * two tile pipelines stay independent. If the routing tileset isn't
+   * published yet (or its region is missing), fall back to the display basemap
+   * so the graph still builds. The zoom travels with the tileset — its
+   * manifest `maxZoom` — so the worker fetches the right detail level whichever
+   * source it ends up using (routing z13, or display z14 on fallback).
+   */
+  function resolveGraphSource(
+    displayManifest: TileManifest,
+    routingManifest: TileManifest | null,
+    region: ManifestRegion,
+  ): { url: string; zoom: number } {
+    if (routingManifest) {
+      const routingRegion = findRegionById(routingManifest, region.id);
+      if (routingRegion) {
+        return {
+          url: resolveRegionUrl(ROUTING_MANIFEST_URL, routingRegion),
+          zoom: routingManifest.maxZoom,
+        };
+      }
+    }
+    console.warn(
+      `[tiles] no routing tiles for region '${region.id}'; ` +
+        'graph will build from display basemap tiles',
+    );
+    return {
+      url: resolveRegionUrl(MANIFEST_URL, region),
+      zoom: displayManifest.maxZoom,
+    };
+  }
+
+  function initMap(
+    region: ManifestRegion,
+    graphUrl: string,
+    graphZoom: number,
+    center: LngLat,
+    located: boolean,
+  ): void {
     const pmtilesUrl = resolveRegionUrl(MANIFEST_URL, region);
+    graphTileZoom = graphZoom;
     registerPMTilesProtocol();
 
     map = new maplibregl.Map({
@@ -481,7 +529,7 @@
       if (routeMode) onDebugClick(e.lngLat);
     });
 
-    graphStore.service = new GraphService(pmtilesUrl);
+    graphStore.service = new GraphService(graphUrl, graphZoom);
 
     if (located) {
       showUserMarker(center);
@@ -501,10 +549,13 @@
 
   onMount(async () => {
     try {
-      // Fetch manifest and geolocate in parallel — boot blocks on the slower
-      // of the two (usually geolocation, capped at ~7s by getCurrentPosition).
-      const [manifest, geo] = await Promise.all([
+      // Fetch both manifests and geolocate in parallel — boot blocks on the
+      // slowest (usually geolocation, capped at ~7s by getCurrentPosition).
+      // The routing manifest is optional: if it's unavailable the graph falls
+      // back to display tiles, so a failure there must not abort boot.
+      const [manifest, routingManifest, geo] = await Promise.all([
         fetchManifest(MANIFEST_URL),
+        fetchRoutingManifest(),
         tryGeolocate(),
       ]);
 
@@ -516,13 +567,28 @@
       const region = selectRegion(manifest, initialLocation.lng, initialLocation.lat);
       currentRegion = region;
 
-      initMap(region, initialLocation, located);
+      const graphSource = resolveGraphSource(manifest, routingManifest, region);
+      initMap(region, graphSource.url, graphSource.zoom, initialLocation, located);
     } catch (err) {
       bootError = err instanceof Error ? err.message : String(err);
     } finally {
       booting = false;
     }
   });
+
+  /** Optional fetch: routing tiles may not be deployed yet — never fatal. */
+  async function fetchRoutingManifest(): Promise<TileManifest | null> {
+    try {
+      return await fetchManifest(ROUTING_MANIFEST_URL);
+    } catch (err) {
+      console.warn(
+        `[tiles] routing manifest unavailable (${ROUTING_MANIFEST_URL}); ` +
+          'graph will build from display basemap tiles',
+        err,
+      );
+      return null;
+    }
+  }
 
   onDestroy(() => {
     mapStore.instance = null;
@@ -574,7 +640,7 @@
   <button
     onclick={toggleTiles}
     disabled={!graphStore.graph}
-    title="Toggle z14 tile boundaries — check whether road gaps fall on tile seams"
+    title="Toggle z13 tile boundaries — check whether road gaps fall on tile seams"
   >
     {showTiles ? 'Hide' : 'Show'} tiles
   </button>

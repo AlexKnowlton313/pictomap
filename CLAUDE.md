@@ -93,10 +93,11 @@ Don't mix these. The boundaries are: `projectContourToLngLat` (pixel → lng/lat
 
 ## Deployment
 
-Two independent pipelines:
+Three independent pipelines:
 
 - **App** (`./deploy.sh`, GitHub Actions `deploy.yml` on push to main): builds and syncs to `s3://alex-knowlton/pictomap/`, invalidates CloudFront. Doesn't bake in tile URLs — the app fetches the manifest at runtime.
-- **Tiles** (`./deploy-tiles.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL.
+- **Display tiles** (`./deploy-tiles.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL. These drive the **MapLibre basemap** only.
+- **Routing tiles** (`./deploy-routing-tiles.sh`, GitHub Actions `deploy-routing-tiles.yml` weekly): generates a custom roads+paths tileset from raw OSM (Geofabrik extracts → optional `osmium merge` → `tilemaker`) and writes `routing-manifest.json`. These drive the **road graph** — see below.
 
 ### Tiles architecture
 
@@ -110,3 +111,19 @@ Regions are defined in `tiles/regions.json` (id, name, bbox per region). The bui
 Crossing into another region requires a page refresh — `maxBounds` blocks panning out, and the "Re-center" button surfaces an out-of-region banner if geolocation lands the user elsewhere.
 
 The manifest URL is stable, so tile rebuilds (weekly) don't require an app redeploy — clients just pick up the new entries on next page load.
+
+### Routing tileset (graph source)
+
+The display basemap is generalized for cartography — it quantizes geometry and drops/simplifies minor paths, which the graph builder saw as disconnected edges. So the **graph builds from a separate, purpose-built routing tileset**, not the basemap:
+
+- **Schema** (`tiles/routing/process.lua`): one `roads` layer of *runnable* highways only — vehicle roads + pedestrian paths (footway/path/pedestrian/steps/track/bridleway/cycleway/corridor). Railways/aerialways/ferries are other OSM keys and never read; construction/proposed/raceway/etc. are dropped. Attributes mirror the Protomaps schema (`kind_detail` = raw OSM `highway=`, plus `kind`/`bridge`/`tunnel`/`layer`) so `graph/highway.ts` and `worker.ts` consume it unchanged.
+- **Zoom/extent** (`tiles/routing/config.json`): a single zoom (z13) with `high_resolution` extent, so ground precision ≈ the old z14 display tiles while the client fetches ~4x fewer tiles per graph build. `GRAPH_ZOOM` in `graph/tile-math.ts` must equal the tileset `maxzoom`.
+- **Sources**: `tiles/osm-sources.json` maps each region id (same `tiles/regions.json`) to its Geofabrik extract(s) — kept separate from `regions.json` so the display pipeline never sees them.
+- **Client wiring**: `Map.svelte` fetches `routing-manifest.json` alongside `manifest.json` and passes the routing region's URL to `GraphService`; the basemap still uses the display URL. If the routing manifest/region is unavailable, the graph **falls back to display tiles** (old behavior), so the routing pipeline can be rolled out independently of the app.
+
+**tilemaker has no brew/apt formula** — build from source or use the Docker image:
+
+- Source: `brew install boost lua shapelib rapidjson && git clone https://github.com/systemed/tilemaker && cd tilemaker && make && sudo make install` (or skip `make install` and pass `TILEMAKER=./tilemaker/tilemaker` to the script). Needs a recent build — the profile's `high_resolution` config key predates any tagged release, so build from `master`.
+- Docker: `docker run --rm -v /tmp:/tmp -v "$PWD:$PWD" -w "$PWD" ghcr.io/systemed/tilemaker:master …`. The CI workflow installs a one-line wrapper of exactly this at `/usr/local/bin/tilemaker` so the script calls `tilemaker` unchanged; do the same locally to drive the script via Docker.
+
+Then `brew install osmium-tool` and run `ONLY_REGION=<id> SKIP_UPLOAD=1 ./deploy-routing-tiles.sh` — builds the `.pmtiles` into `./routing-tiles-out/` with no S3 or AWS creds. Continental regions are large downloads; for a quick check, point a scratch `REGIONS_FILE`/`SOURCES_FILE` at a small city bbox + a Geofabrik city/state extract.

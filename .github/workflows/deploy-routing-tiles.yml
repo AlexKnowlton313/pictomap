@@ -1,0 +1,173 @@
+# Weekly: generate the regional ROUTING PMTiles ourselves from raw OSM and
+# upload them to S3, plus routing-manifest.json at a stable URL. Independent of
+# the display-tiles pipeline (deploy-tiles.yml) — different source (Geofabrik,
+# not Protomaps), different schema (roads + ped paths only, one detail-
+# preserving zoom), different manifest. The app fetches both manifests at
+# startup; the graph worker uses the routing one.
+#
+# Regions are defined in tiles/regions.json; per-region OSM source extracts in
+# tiles/osm-sources.json. Each archive must stay under CloudFront's 30GB
+# per-object cap; deploy-routing-tiles.sh hard-fails if any region exceeds it.
+#
+# Sharded across runners (one region each) like deploy-tiles.yml, but these
+# jobs are HEAVY: continent extracts are large (europe ~28GB) and tilemaker
+# reads every node, so the build job runs with a generous timeout and frees as
+# much disk as possible. If weekly proves too costly, drop to monthly — routing
+# topology changes slowly.
+#
+# Reuses AWS_TILES_ROLE_ARN from deploy-tiles.yml (same s3:PutObject on
+# arn:aws:s3:::alex-knowlton/pictomap/tiles/*).
+
+name: Deploy routing tiles
+
+on:
+  schedule:
+    # Mondays at 09:00 UTC — offset from the display-tiles run (07:00) so the
+    # two heavy tile jobs don't contend for the same hosted-runner pool.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      zoom:
+        description: Single publish zoom (extent in config keeps z14 precision)
+        required: false
+        default: '13'
+      build_date:
+        description: Version stamp YYYYMMDD (blank = today UTC)
+        required: false
+
+concurrency:
+  group: deploy-routing-tiles
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Resolve the build date + zoom + region matrix ONCE so every shard agrees.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      build_date: ${{ steps.meta.outputs.build_date }}
+      zoom: ${{ steps.meta.outputs.zoom }}
+      regions: ${{ steps.meta.outputs.regions }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve build metadata
+        id: meta
+        env:
+          ZOOM: ${{ inputs.zoom || '13' }}
+          BUILD_DATE_INPUT: ${{ inputs.build_date }}
+        run: |
+          set -euo pipefail
+          BUILD_DATE="$BUILD_DATE_INPUT"
+          [ -z "$BUILD_DATE" ] && BUILD_DATE="$(date -u +%Y%m%d)"
+          REGIONS=$(jq -c '[.[].id]' tiles/regions.json)
+          {
+            echo "build_date=$BUILD_DATE"
+            echo "zoom=$ZOOM"
+            echo "regions=$REGIONS"
+          } >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE zoom=$ZOOM regions=$REGIONS"
+
+  # One region per runner. fail-fast: false so a single region's failure doesn't
+  # cancel the others; assemble needs the whole build job to pass, so a failure
+  # still prevents a partial manifest.
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    # Continent download + tilemaker over a full continent can take well over an
+    # hour for the dense regions. Generous cap so a slow region completes.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      # Several Asia regions (me, sas, eas, sea-oc) read the same Geofabrik
+      # asia extract; keep parallelism modest so we don't hammer the mirror.
+      max-parallel: 4
+      matrix:
+        region: ${{ fromJson(needs.setup.outputs.regions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Continent extracts + the on-disk node store need lots of scratch.
+      # Reclaim everything we can, including large packages this time.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install osmium + tilemaker (official Docker image)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends osmium-tool
+          # tilemaker has no apt/brew formula; use the maintainers' image rather
+          # than a fragile from-source build. `:master` because the profile's
+          # `high_resolution` config key predates any tagged release. A thin
+          # wrapper on PATH lets deploy-routing-tiles.sh call `tilemaker`
+          # unchanged; mounting /tmp (mktemp scratch) and the workspace at their
+          # real paths makes the script's absolute + relative paths resolve
+          # identically inside the container.
+          docker pull ghcr.io/systemed/tilemaker:master
+          {
+            echo '#!/usr/bin/env bash'
+            echo 'exec docker run --rm -v /tmp:/tmp -v "$PWD:$PWD" -w "$PWD" ghcr.io/systemed/tilemaker:master "$@"'
+          } | sudo tee /usr/local/bin/tilemaker >/dev/null
+          sudo chmod +x /usr/local/bin/tilemaker
+          tilemaker --version || true
+          osmium --version
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Build & upload ${{ matrix.region }}
+        env:
+          ONLY_REGION: ${{ matrix.region }}
+          BUILD_DATE: ${{ needs.setup.outputs.build_date }}
+          ZOOM: ${{ needs.setup.outputs.zoom }}
+          EMIT_MANIFEST: '0'
+          FRAGMENT_DIR: ${{ github.workspace }}/fragments
+        run: ./deploy-routing-tiles.sh
+
+      - name: Upload manifest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: routing-fragment-${{ matrix.region }}
+          path: fragments/${{ matrix.region }}.json
+          retention-days: 1
+          if-no-files-found: error
+
+  # Gather every shard's fragment and publish the merged routing-manifest.json.
+  assemble:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: fragments
+          pattern: routing-fragment-*
+          merge-multiple: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Assemble & upload routing manifest
+        env:
+          SOURCE_DATE: ${{ needs.setup.outputs.build_date }}
+          MIN_ZOOM: ${{ needs.setup.outputs.zoom }}
+          MAX_ZOOM: ${{ needs.setup.outputs.zoom }}
+          MANIFEST_NAME: routing-manifest.json
+          FRAGMENT_DIR: ${{ github.workspace }}/fragments
+        run: ./assemble-manifest.sh

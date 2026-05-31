@@ -1,0 +1,11 @@
+{
+  "_comment": "OSM .osm.pbf source extracts per region id (matches tiles/regions.json). Kept separate from regions.json so the display tiles pipeline (deploy-tiles.sh) is unaffected and never leaks these into manifest.json. deploy-routing-tiles.sh downloads each region's sources, osmium-merges them when there's more than one, then runs tilemaker clipped to the region bbox. Continent-level Geofabrik extracts are used: regions whose bbox is a sub-area of a continent (me, sas) read the whole continent and let tilemaker's --bbox clip; cross-continent regions (eas, sea-oc) merge two extracts. These are large weekly downloads — see the workflow header for the cost note.",
+  "na":     { "sources": ["https://download.geofabrik.de/north-america-latest.osm.pbf"] },
+  "sa":     { "sources": ["https://download.geofabrik.de/south-america-latest.osm.pbf"] },
+  "eu":     { "sources": ["https://download.geofabrik.de/europe-latest.osm.pbf"] },
+  "af":     { "sources": ["https://download.geofabrik.de/africa-latest.osm.pbf"] },
+  "me":     { "sources": ["https://download.geofabrik.de/asia-latest.osm.pbf"] },
+  "sas":    { "sources": ["https://download.geofabrik.de/asia-latest.osm.pbf"] },
+  "eas":    { "sources": ["https://download.geofabrik.de/asia-latest.osm.pbf", "https://download.geofabrik.de/russia-latest.osm.pbf"] },
+  "sea-oc": { "sources": ["https://download.geofabrik.de/asia-latest.osm.pbf", "https://download.geofabrik.de/australia-oceania-latest.osm.pbf"] }
+}

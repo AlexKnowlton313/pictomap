@@ -1,11 +1,15 @@
 import type { BBox } from './types';
 
 /**
- * Web Mercator tile math. We work at a single zoom (z14) where Protomaps
- * stops simplifying road geometry — see `tasks.md` § Architecture.
+ * Web Mercator tile math. We work at a single zoom — the max (and only) zoom
+ * of the routing tileset (tiles/routing/), which is published at z13 with a
+ * high-resolution MVT extent so its ground precision matches the old z14
+ * display tiles while needing ~4x fewer tile requests per graph build. The
+ * worker decodes whatever extent the tile declares, so only this zoom (and the
+ * tileset URL) must agree with the tiles/routing/config.json `maxzoom`.
  */
 
-export const GRAPH_ZOOM = 14;
+export const GRAPH_ZOOM = 13;
 
 const EARTH_RADIUS_M = 6_371_008.8;
 

@@ -62,7 +62,9 @@ export interface MatchResultMsg {
 // --- Worker message protocol ---------------------------------------------
 
 export type WorkerRequest =
-  | { type: 'init'; reqId: number; pmtilesUrl: string }
+  // graphZoom = max zoom of the tileset at pmtilesUrl (routing tiles z13, or
+  // display tiles z14 on fallback). The worker fetches/decodes at this zoom.
+  | { type: 'init'; reqId: number; pmtilesUrl: string; graphZoom: number }
   | { type: 'buildGraph'; reqId: number; bbox: BBox }
   | { type: 'match'; reqId: number; contour: [number, number][] };
 

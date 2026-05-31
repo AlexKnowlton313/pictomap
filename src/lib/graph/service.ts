@@ -19,7 +19,7 @@ export class GraphService {
   >();
   private readyP: Promise<void>;
 
-  constructor(pmtilesUrl: string) {
+  constructor(pmtilesUrl: string, graphZoom: number) {
     this.worker = new Worker(new URL('./worker.ts', import.meta.url), {
       type: 'module',
       name: 'pictomap-graph',
@@ -36,7 +36,7 @@ export class GraphService {
         resolve: () => resolve(),
         reject,
       });
-      this.send({ type: 'init', reqId, pmtilesUrl });
+      this.send({ type: 'init', reqId, pmtilesUrl, graphZoom });
     });
   }
 

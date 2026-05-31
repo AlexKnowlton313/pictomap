@@ -28,14 +28,16 @@ import type {
  *
  * Lifecycle:
  *   1. `init` — receive PMTiles URL, instantiate PMTiles client.
- *   2. `buildGraph` — fetch all z14 tiles covering bbox, decode MVT,
- *      classify the `roads` layer, stitch endpoints into nodes, reply
- *      with a flat RoadGraph.
+ *   2. `buildGraph` — fetch all routing-tileset tiles (GRAPH_ZOOM) covering
+ *      bbox, decode MVT, classify the `roads` layer, stitch endpoints into
+ *      nodes, reply with a flat RoadGraph.
  */
 
 let pmtiles: PMTiles | null = null;
 let tileCache: TileCache | null = null;
 let matcher: Matcher | null = null;
+/** Max zoom of the active tileset; set at init. See GRAPH_ZOOM for the default. */
+let graphZoom = GRAPH_ZOOM;
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -44,6 +46,7 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   try {
     if (req.type === 'init') {
       pmtiles = new PMTiles(req.pmtilesUrl);
+      graphZoom = req.graphZoom;
       tileCache = new TileCache(req.pmtilesUrl);
       // Fire-and-forget: drop entries from older PMTiles URLs so the
       // cache doesn't grow unbounded as the daily build rotates.
@@ -54,7 +57,7 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
     if (req.type === 'buildGraph') {
       if (!pmtiles) throw new Error('Worker not initialized — send `init` first');
-      const graph = await buildGraph(pmtiles, req.bbox);
+      const graph = await buildGraph(pmtiles, req.bbox, graphZoom);
       // Keep the latest graph live so the matcher can query it without
       // re-shipping ~20k edges from the main thread on every snap.
       matcher = new Matcher(graph);
@@ -113,7 +116,7 @@ const MIN_COMPONENT_EDGES = 100;
  * crossing tile boundaries will read as disconnected. Set back to `true`
  * for production graphs.
  */
-const PROXIMITY_MERGE: boolean = false;
+const PROXIMITY_MERGE: boolean = true;
 
 /**
  * Max concurrent PMTiles range requests. At low zoom the buffered
@@ -123,9 +126,9 @@ const PROXIMITY_MERGE: boolean = false;
  */
 const TILE_FETCH_CONCURRENCY = 16;
 
-async function buildGraph(p: PMTiles, bbox: BBox): Promise<RoadGraph> {
+async function buildGraph(p: PMTiles, bbox: BBox, z: number): Promise<RoadGraph> {
   const t0 = performance.now();
-  const range = tilesCoveringBBox(bbox, GRAPH_ZOOM);
+  const range = tilesCoveringBBox(bbox, z);
   const stats = { hits: 0, misses: 0, netMs: 0, decodeMs: 0 };
 
   const tileCoords: { x: number; y: number }[] = [];
@@ -312,7 +315,7 @@ function stitch(
   // refLat is the bbox center: viewport-driven rebuilds now span tens of
   // km at low zoom, so picking a corner vertex would bias the lng scale
   // toward one side of the graph.
-  const EPS_M = 2;
+  const EPS_M = 1;
   const M_PER_DEG_LAT = 111_320;
   const epsLat = EPS_M / M_PER_DEG_LAT;
   const epsLng = EPS_M / (M_PER_DEG_LAT * Math.cos((refLat * Math.PI) / 180));

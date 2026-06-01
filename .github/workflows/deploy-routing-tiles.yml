@@ -37,7 +37,6 @@ jobs:
     permissions:
       id-token: write   # AWS OIDC
       contents: read    # checkout
-      actions: write    # cleanup job deletes the prepared-source artifacts
     secrets: inherit
     with:
       script: tiles/build-routing.sh
@@ -55,3 +54,36 @@ jobs:
       # Continent builds run past the default 1h OIDC session; request one that
       # outlives the 180m timeout (role MaxSessionDuration must allow it).
       role_duration: 14400
+
+  # Reclaim the prepare job's roads-* scratch artifacts as soon as the pipeline
+  # finishes — they're large (hundreds of MB each) and only needed to pass
+  # prepare -> build within this run (retention-days:1 on the upload is just a
+  # backstop). This lives in the caller, not the reusable workflow, so display
+  # callers don't have to grant actions:write. Artifacts are run-scoped and a
+  # reusable-workflow call shares this run_id, so the roads-* uploaded by the
+  # nested prepare job are visible here.
+  cleanup:
+    needs: tiles
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Delete prepared-source artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api --paginate "/repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("roads-")) | .id')
+          if [ -z "$ids" ]; then
+            echo "no roads-* artifacts to delete"
+            exit 0
+          fi
+          for id in $ids; do
+            echo "deleting artifact $id"
+            gh api --method DELETE "/repos/$REPO/actions/artifacts/$id"
+          done

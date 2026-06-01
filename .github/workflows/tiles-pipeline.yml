@@ -325,36 +325,3 @@ jobs:
           MANIFEST_NAME: ${{ inputs.manifest_name }}
           FRAGMENT_DIR: ${{ github.workspace }}/fragments
         run: tiles/assemble-manifest.sh
-
-  # Reclaim the prepared-source artifacts as soon as the run finishes — they're
-  # large (hundreds of MB each) and only needed to pass between prepare and
-  # build within this run. retention-days:1 on the upload is just a backstop;
-  # this deletes them immediately instead of waiting out the TTL. always() so it
-  # runs even if build/assemble failed; routing only. Needs actions:write, which
-  # the caller must grant (deploy-routing-tiles.yml does).
-  cleanup:
-    needs: [setup, prepare, build, assemble]
-    if: ${{ always() && inputs.tools == 'osm' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Delete prepared-source artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          ids=$(gh api --paginate "/repos/$REPO/actions/runs/$RUN_ID/artifacts" \
-            --jq '.artifacts[] | select(.name | startswith("roads-")) | .id')
-          if [ -z "$ids" ]; then
-            echo "no roads-* artifacts to delete"
-            exit 0
-          fi
-          for id in $ids; do
-            echo "deleting artifact $id"
-            gh api --method DELETE "/repos/$REPO/actions/artifacts/$id"
-          done

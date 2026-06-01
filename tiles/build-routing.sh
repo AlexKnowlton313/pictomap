@@ -11,28 +11,33 @@
 #
 # Per region (see tiles/regions.json for ids/bboxes, tiles/osm-sources.json for
 # the Geofabrik source extract(s) per id):
-#   1. Download the region's OSM source extract(s).
+#   1. Resolve each source to a prefiltered roads-only .osm.pbf: reuse one from
+#      ROADS_DIR if present (CI prepares each distinct source ONCE and fans it
+#      out via artifacts; a standalone full run reuses across regions in TMP),
+#      else download + filter it on the fly via prepare-source.sh.
 #   2. osmium-merge them when there's more than one (cross-continent regions).
-#   3. osmium tags-filter to highways only (the big speed/disk win — see below).
-#   4. tilemaker --bbox <extent>, using tiles/routing/{config.json,process.lua},
+#   3. tilemaker --bbox <extent>, using tiles/routing/{config.json,process.lua},
 #      -> a date-versioned PMTiles archive.
-#   5. Hard-fail if it exceeds CloudFront's 30GB per-object cap.
-#   6. Upload with immutable Cache-Control; write a manifest fragment.
+#   4. Hard-fail if it exceeds CloudFront's 30GB per-object cap.
+#   5. Upload with immutable Cache-Control; write a manifest fragment.
 # A full run then assembles routing-manifest.json (assemble-manifest.sh).
 #
 # Each region is built over its *extent* bbox (ownership bbox + OVERLAP_DEG
 # margin) so chunked regions are ready for multi-archive reads. See
 # docs/regional-chunking.md.
 #
-# COST NOTE: these are heavy. The continent extracts are large (europe ~28GB,
-# asia ~13GB) and tilemaker reads every node in the input. Budget tens of
-# minutes and tens of GB of scratch per region; CI shards one region per runner
-# and frees disk first.
+# COST NOTE: still heavy, but the continent download+filter now happens once per
+# distinct source rather than once per region (the old waste where every NA
+# chunk re-pulled North America, every Asia region re-pulled Asia). tilemaker
+# still reads every node of its input — budget tens of minutes + tens of GB of
+# scratch per region; CI shards one region per runner and frees disk first.
 #
 # Runs whole or sharded, mirroring build-display.sh:
 #   ONLY_REGION     build just this region id (default: all in REGIONS_FILE)
 #   EMIT_MANIFEST   0 to skip the manifest (matrix shards); default 1
 #   FRAGMENT_DIR    where per-region manifest fragments are written
+#   ROADS_DIR       dir of prefiltered <key>-roads.osm.pbf (CI artifacts); any
+#                   source not found there is downloaded + filtered on the fly
 #   BUILD_DATE      version stamp YYYYMMDD (default: today UTC)
 #   ZOOM            single publish zoom (default 13; see config.json extent note)
 #   SKIP_UPLOAD     1 to build PMTiles into OUT_DIR without touching S3 (local
@@ -72,6 +77,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 FRAGMENT_DIR="${FRAGMENT_DIR:-$TMP_DIR/fragments}"
 mkdir -p "$FRAGMENT_DIR"
 
+# Where prefiltered roads pbfs live. CI populates this from the prepare jobs'
+# artifacts; standalone runs default to TMP so prepared sources are reused
+# across regions within one run (e.g. Asia prepared once for me/sas/eas/sea-oc).
+ROADS_DIR="${ROADS_DIR:-$TMP_DIR}"
+mkdir -p "$ROADS_DIR"
+
 # tilemaker may be a PATH command or an explicit path (the TILEMAKER override);
 # its install hint is multi-line, so check it separately from require_cmds.
 if ! command -v "$TILEMAKER" >/dev/null 2>&1; then
@@ -84,7 +95,8 @@ if ! command -v "$TILEMAKER" >/dev/null 2>&1; then
   exit 1
 fi
 
-# aws is only needed when publishing; SKIP_UPLOAD builds offline.
+# curl is needed only for the on-the-fly download fallback; aws only when
+# publishing. osmium (merge/filter) and jq are always needed.
 require_cmds osmium curl jq
 [ "$SKIP_UPLOAD" = "1" ] || require_cmds aws
 
@@ -99,6 +111,7 @@ REGIONS_JSON=$(select_regions "$REGIONS_FILE" "$ONLY_REGION")
 REGION_COUNT=$(jq 'length' <<<"$REGIONS_JSON")
 echo "Build date: $BUILD_DATE"
 echo "Zoom:       z${ZOOM} (high-resolution extent ~= z14 ground precision)"
+echo "Roads dir:  $ROADS_DIR"
 echo "Regions:    $REGION_COUNT$( [ -n "$ONLY_REGION" ] && echo " (only: $ONLY_REGION)" || echo " (from $REGIONS_FILE)" )"
 echo
 
@@ -122,69 +135,37 @@ while IFS= read -r region; do
 
   echo "[${i}/${REGION_COUNT}] ${REGION_NAME} (extent ${EXTENT_BBOX}) — ${#SOURCES[@]} source(s)"
 
-  # 1. Download.
-  LOCAL_FILES=()
-  n=0
+  # 1. Resolve each source to a prefiltered roads-only pbf, preparing any that
+  #    aren't already present. Prepared files are left in place (never deleted)
+  #    so they're reused by later regions sharing the same source.
+  ROADS=()
   for url in "${SOURCES[@]}"; do
-    n=$((n + 1))
-    f="${TMP_DIR}/${REGION_ID}-src${n}.osm.pbf"
-    echo "    download ${url}"
-    # Multi-GB continent extracts: curl's own progress meter doesn't render to a
-    # non-tty CI log legibly, so run curl in the background and print a periodic
-    # MB/percent line off the growing file instead. HEAD first for the total so
-    # we can show a percentage (bytes-only if the server won't report it). curl's
-    # stderr (the real errors) is kept in DL_LOG and surfaced if it exits non-zero.
-    DL_LOG="${TMP_DIR}/download-${REGION_ID}-src${n}.log"
-    TOTAL=$(curl -fsSLI "$url" 2>/dev/null \
-      | awk 'tolower($1) ~ /^content-length:/ {print $2}' | tr -d '\r' | tail -1)
-    case "$TOTAL" in ''|*[!0-9]*) TOTAL=0 ;; esac
-    curl -fSL --retry 3 --retry-delay 5 -o "$f" "$url" 2>"$DL_LOG" &
-    dlpid=$!
-    while kill -0 "$dlpid" 2>/dev/null; do
-      cur=$(file_size "$f" 2>/dev/null || echo 0)
-      if [ "$TOTAL" -gt 0 ]; then
-        echo "      ${REGION_ID} src${n}: $((cur / 1048576)) / $((TOTAL / 1048576)) MB ($((cur * 100 / TOTAL))%)"
-      else
-        echo "      ${REGION_ID} src${n}: $((cur / 1048576)) MB"
-      fi
-      sleep 20
-    done
-    if ! wait "$dlpid"; then   # propagate curl's exit status under set -e
-      cat "$DL_LOG" >&2
-      exit 1
+    key=$(source_key "$url")
+    roads="${ROADS_DIR}/${key}-roads.osm.pbf"
+    if [ -f "$roads" ]; then
+      echo "    source ${key}: using prepared roads ($(du -h "$roads" | cut -f1))"
+    else
+      echo "    source ${key}: not prepared — downloading + filtering now"
+      "$SCRIPT_DIR/prepare-source.sh" "$url" "$roads"
     fi
-    LOCAL_FILES+=("$f")
+    ROADS+=("$roads")
   done
 
-  # 2. Merge multi-source regions; otherwise feed the single extract directly.
+  # 2. Merge multi-source regions; otherwise feed the single roads pbf directly.
+  #    Merging the small filtered files (not the full continents) is cheap.
   #    tilemaker's --bbox does the spatial clipping, so no osmium extract step
   #    is needed even when a region is only a sub-area of its source continent.
-  if [ "${#LOCAL_FILES[@]}" -gt 1 ]; then
-    INPUT="${TMP_DIR}/${REGION_ID}-merged.osm.pbf"
-    echo "    osmium merge ${#LOCAL_FILES[@]} sources"
-    osmium merge "${LOCAL_FILES[@]}" -o "$INPUT" --overwrite
-    rm -f "${LOCAL_FILES[@]}"   # reclaim disk before tilemaker
+  MERGED=""
+  if [ "${#ROADS[@]}" -gt 1 ]; then
+    INPUT="${TMP_DIR}/${REGION_ID}-merged-roads.osm.pbf"
+    MERGED="$INPUT"   # ours to delete after tilemaker (prepared roads are not)
+    echo "    osmium merge ${#ROADS[@]} prepared sources"
+    osmium merge "${ROADS[@]}" -o "$INPUT" --overwrite
   else
-    INPUT="${LOCAL_FILES[0]}"
+    INPUT="${ROADS[0]}"
   fi
 
-  # 3. Pre-filter to highways before tilemaker. process.lua keeps only highway=
-  #    ways, but tilemaker still *reads* — and builds an on-disk node store over
-  #    — every building/landuse/waterway node in the whole continent first
-  #    (that's the 30GB+ store and the multi-hour read seen in the logs). osmium
-  #    strips all of it in one streaming pass; matched ways keep their referenced
-  #    nodes (osmium's default, so geometry survives) plus the bridge/tunnel/
-  #    layer tags the schema reads — so tilemaker emits the same `roads` tiles
-  #    from a small fraction of the data, and its store no longer spills to disk.
-  #    The construction/raceway/etc. highway values this passes through are still
-  #    dropped by process.lua's ROAD_KINDS gate.
-  FILTERED="${TMP_DIR}/${REGION_ID}-roads.osm.pbf"
-  echo "    osmium tags-filter -> highways only"
-  osmium tags-filter "$INPUT" w/highway -o "$FILTERED" --overwrite
-  rm -f "$INPUT"            # reclaim the full extract before tilemaker
-  INPUT="$FILTERED"
-
-  # 4. tilemaker -> PMTiles. --store keeps the node index on disk so large
+  # 3. tilemaker -> PMTiles. --store keeps the node index on disk so large
   #    continents stay within the RAM budget. Chatty on stderr; run_logged
   #    samples it to the terminal and keeps the full log to surface on failure.
   OUTPUT_NAME="pictomap-routing-${REGION_ID}-${BUILD_DATE}-z${ZOOM}.pmtiles"
@@ -203,8 +184,8 @@ while IFS= read -r region; do
     cat "$TM_LOG" >&2
     exit 1
   fi
-  rm -f "$INPUT"
   rm -rf "$STORE_DIR"
+  [ -n "$MERGED" ] && rm -f "$MERGED"   # keep prepared roads; drop the merge temp
 
   SIZE_BYTES=$(file_size "$OUTPUT_PATH")
   echo "    -> ${OUTPUT_NAME} ($(du -h "$OUTPUT_PATH" | cut -f1))"

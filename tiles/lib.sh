@@ -95,6 +95,15 @@ expand_bbox() {
   }'
 }
 
+# source_key URL -> stable key naming the source's prefiltered roads pbf and CI
+# artifact: the basename minus the .osm.pbf suffix. Distinct per source, so a
+# continent downloaded+filtered once fans out to every chunk that uses it. e.g.
+#   https://download.geofabrik.de/asia-latest.osm.pbf -> asia-latest
+source_key() {
+  local base="${1##*/}"
+  printf '%s' "${base%.osm.pbf}"
+}
+
 # file_size PATH -> size in bytes (BSD or GNU stat).
 file_size() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1"

@@ -95,6 +95,7 @@ jobs:
       min_zoom: ${{ steps.meta.outputs.min_zoom }}
       max_zoom: ${{ steps.meta.outputs.max_zoom }}
       regions: ${{ steps.meta.outputs.regions }}
+      sources: ${{ steps.meta.outputs.sources }}
     steps:
       - uses: actions/checkout@v4
       - name: Resolve build metadata
@@ -125,19 +126,76 @@ jobs:
             echo "Source $URL OK"
           fi
           REGIONS=$(jq -c '[.[].id]' tiles/regions.json)
+          # Distinct OSM source extracts across all regions (routing only — the
+          # prepare matrix fans these out; display ignores it).
+          SOURCES=$(jq -c '[to_entries[] | select(.key != "_comment") | .value.sources[]] | unique' tiles/osm-sources.json)
           {
             echo "date=$DATE"
             echo "min_zoom=$MIN_ZOOM"
             echo "max_zoom=$MAX_ZOOM"
             echo "regions=$REGIONS"
+            echo "sources=$SOURCES"
           } >> "$GITHUB_OUTPUT"
           echo "date=$DATE zooms=z${MIN_ZOOM}-z${MAX_ZOOM} regions=$REGIONS"
 
+  # Routing only: download + filter each DISTINCT source extract ONCE and hand
+  # it to the build shards as an artifact, instead of every region (e.g. all
+  # three na-* chunks, or all four Asia regions) re-downloading its whole
+  # continent. Skipped for the display pipeline, which has no OSM sources.
+  prepare:
+    needs: setup
+    if: inputs.tools == 'osm'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.build_timeout }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        source: ${{ fromJson(needs.setup.outputs.sources) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+      - name: Install osmium
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends osmium-tool
+          osmium --version
+      - name: Resolve source key
+        id: key
+        env:
+          SRC: ${{ matrix.source }}
+        run: echo "key=$(basename "$SRC" .osm.pbf)" >> "$GITHUB_OUTPUT"
+      - name: Prepare ${{ steps.key.outputs.key }}
+        env:
+          SRC: ${{ matrix.source }}
+          KEY: ${{ steps.key.outputs.key }}
+        run: tiles/prepare-source.sh "$SRC" "roads/${KEY}-roads.osm.pbf"
+      - name: Upload prepared source
+        uses: actions/upload-artifact@v4
+        with:
+          name: roads-${{ steps.key.outputs.key }}
+          path: roads/${{ steps.key.outputs.key }}-roads.osm.pbf
+          # Backstop only (1 day is the action's floor); the cleanup job deletes
+          # these as soon as the run finishes.
+          retention-days: 1
+          if-no-files-found: error
+
   # One region per runner. fail-fast: false so one region's failure doesn't
   # cancel the others; assemble still needs the whole build job to pass, so a
-  # failure prevents a partial manifest.
+  # failure prevents a partial manifest. always() + the result checks let build
+  # proceed whether prepare ran (routing) or was skipped (display).
   build:
-    needs: setup
+    needs: [setup, prepare]
+    if: ${{ always() && needs.setup.result == 'success' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.build_timeout }}
     strategy:
@@ -201,6 +259,16 @@ jobs:
           tilemaker --version || true
           osmium --version
 
+      # Routing: pull every prepared roads pbf (all small) into roads/.
+      # build-routing.sh reads only the ones each region needs (ROADS_DIR).
+      - name: Download prepared sources
+        if: inputs.tools == 'osm'
+        uses: actions/download-artifact@v4
+        with:
+          path: roads
+          pattern: roads-*
+          merge-multiple: true
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
@@ -221,6 +289,9 @@ jobs:
           MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
           ZOOM: ${{ needs.setup.outputs.min_zoom }}
           DOWNLOAD_THREADS: ${{ inputs.download_threads }}
+          # Prefiltered roads pbfs from the prepare job (routing); ignored by the
+          # display script. Empty/absent for display, which doesn't read it.
+          ROADS_DIR: ${{ github.workspace }}/roads
         run: ${{ inputs.script }}
 
       - name: Upload manifest fragment
@@ -254,3 +325,36 @@ jobs:
           MANIFEST_NAME: ${{ inputs.manifest_name }}
           FRAGMENT_DIR: ${{ github.workspace }}/fragments
         run: tiles/assemble-manifest.sh
+
+  # Reclaim the prepared-source artifacts as soon as the run finishes — they're
+  # large (hundreds of MB each) and only needed to pass between prepare and
+  # build within this run. retention-days:1 on the upload is just a backstop;
+  # this deletes them immediately instead of waiting out the TTL. always() so it
+  # runs even if build/assemble failed; routing only. Needs actions:write, which
+  # the caller must grant (deploy-routing-tiles.yml does).
+  cleanup:
+    needs: [setup, prepare, build, assemble]
+    if: ${{ always() && inputs.tools == 'osm' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete prepared-source artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api --paginate "/repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("roads-")) | .id')
+          if [ -z "$ids" ]; then
+            echo "no roads-* artifacts to delete"
+            exit 0
+          fi
+          for id in $ids; do
+            echo "deleting artifact $id"
+            gh api --method DELETE "/repos/$REPO/actions/artifacts/$id"
+          done

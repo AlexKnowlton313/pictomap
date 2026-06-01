@@ -35,8 +35,9 @@ jobs:
   tiles:
     uses: ./.github/workflows/tiles-pipeline.yml
     permissions:
-      id-token: write
-      contents: read
+      id-token: write   # AWS OIDC
+      contents: read    # checkout
+      actions: write    # cleanup job deletes the prepared-source artifacts
     secrets: inherit
     with:
       script: tiles/build-routing.sh

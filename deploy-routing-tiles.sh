@@ -33,7 +33,8 @@
 #   SKIP_UPLOAD     1 to build PMTiles into OUT_DIR without touching S3 (local
 #                   iteration; implies no manifest, and aws creds not required)
 #   OUT_DIR         where SKIP_UPLOAD writes archives (default ./routing-tiles-out)
-#   PROGRESS_SAMPLE echo every Nth download/build log line as progress (default 10; 0 = silent)
+#   PROGRESS_SAMPLE echo every Nth tilemaker log line as progress (default 10; 0 = silent)
+#                   (downloads print their own periodic MB/percent line)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -152,11 +153,27 @@ while IFS= read -r region; do
     n=$((n + 1))
     f="${TMP_DIR}/${REGION_ID}-src${n}.osm.pbf"
     echo "    download ${url}"
-    # curl's per-chunk progress (a new line per chunk once its stderr is a pipe)
-    # floods multi-GB extracts; run_logged samples 1/PROGRESS_SAMPLE of it and
-    # keeps the full log. -S keeps real errors in that log, surfaced on failure.
+    # Multi-GB continent extracts: curl's own progress meter doesn't render to a
+    # non-tty CI log legibly, so run curl in the background and print a periodic
+    # MB/percent line off the growing file instead. HEAD first for the total so
+    # we can show a percentage (bytes-only if the server won't report it). curl's
+    # stderr (the real errors) is kept in DL_LOG and surfaced if it exits non-zero.
     DL_LOG="${TMP_DIR}/download-${REGION_ID}-src${n}.log"
-    if ! run_logged "$DL_LOG" curl -fSL --retry 3 --retry-delay 5 -o "$f" "$url"; then
+    TOTAL=$(curl -fsSLI "$url" 2>/dev/null \
+      | awk 'tolower($1) ~ /^content-length:/ {print $2}' | tr -d '\r' | tail -1)
+    case "$TOTAL" in ''|*[!0-9]*) TOTAL=0 ;; esac
+    curl -fSL --retry 3 --retry-delay 5 -o "$f" "$url" 2>"$DL_LOG" &
+    dlpid=$!
+    while kill -0 "$dlpid" 2>/dev/null; do
+      cur=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+      if [ "$TOTAL" -gt 0 ]; then
+        echo "      ${REGION_ID} src${n}: $((cur / 1048576)) / $((TOTAL / 1048576)) MB ($((cur * 100 / TOTAL))%)"
+      else
+        echo "      ${REGION_ID} src${n}: $((cur / 1048576)) MB"
+      fi
+      sleep 20
+    done
+    if ! wait "$dlpid"; then   # propagate curl's exit status under set -e
       cat "$DL_LOG" >&2
       exit 1
     fi
@@ -174,6 +191,22 @@ while IFS= read -r region; do
   else
     INPUT="${LOCAL_FILES[0]}"
   fi
+
+  # 2.5 Pre-filter to highways before tilemaker. process.lua keeps only highway=
+  #     ways, but tilemaker still *reads* — and builds an on-disk node store over
+  #     — every building/landuse/waterway node in the whole continent first
+  #     (that's the 30GB+ store and the multi-hour read seen in the logs). osmium
+  #     strips all of it in one streaming pass; matched ways keep their referenced
+  #     nodes (osmium's default, so geometry survives) plus the bridge/tunnel/
+  #     layer tags the schema reads — so tilemaker emits the same `roads` tiles
+  #     from a small fraction of the data, and its store no longer spills to disk.
+  #     The construction/raceway/etc. highway values this passes through are still
+  #     dropped by process.lua's ROAD_KINDS gate.
+  FILTERED="${TMP_DIR}/${REGION_ID}-roads.osm.pbf"
+  echo "    osmium tags-filter -> highways only"
+  osmium tags-filter "$INPUT" w/highway -o "$FILTERED" --overwrite
+  rm -f "$INPUT"            # reclaim the full extract before tilemaker
+  INPUT="$FILTERED"
 
   # 3. tilemaker -> PMTiles. --store keeps the node index on disk so large
   #    continents stay within the RAM budget. Chatty on stderr; run_logged

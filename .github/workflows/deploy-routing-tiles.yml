@@ -126,6 +126,13 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
           aws-region: us-east-1
+          # Continent builds run well past the default 1h OIDC session, so the
+          # end-of-build `aws s3 cp` was dying with ExpiredToken (only na/eu,
+          # the regions that take >1h). Request a session that outlives the
+          # job's 180m timeout. REQUIRES the role's MaxSessionDuration to be
+          # >= this value (default is 3600) — raise it once with:
+          #   aws iam update-role --role-name <role> --max-session-duration 14400
+          role-duration-seconds: 14400
 
       - name: Build & upload ${{ matrix.region }}
         env:

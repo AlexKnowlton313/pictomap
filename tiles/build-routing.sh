@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build & upload the regional ROUTING PMTiles archives.
 #
-# Unlike deploy-tiles.sh (which range-extracts a subset of Protomaps' prebuilt
+# Unlike build-display.sh (which range-extracts a subset of Protomaps' prebuilt
 # display planet), this pipeline generates tiles ourselves from raw OSM so we
 # control the schema: a single `roads` layer of *runnable* highways (vehicle
 # roads + pedestrian paths), no simplification, high-resolution extent. That
@@ -13,18 +13,23 @@
 # the Geofabrik source extract(s) per id):
 #   1. Download the region's OSM source extract(s).
 #   2. osmium-merge them when there's more than one (cross-continent regions).
-#   3. tilemaker --bbox <region bbox>, using tiles/routing/{config.json,
-#      process.lua}, -> a date-versioned PMTiles archive.
-#   4. Hard-fail if it exceeds CloudFront's 30GB per-object cap.
-#   5. Upload with immutable Cache-Control; write a manifest fragment.
+#   3. osmium tags-filter to highways only (the big speed/disk win — see below).
+#   4. tilemaker --bbox <extent>, using tiles/routing/{config.json,process.lua},
+#      -> a date-versioned PMTiles archive.
+#   5. Hard-fail if it exceeds CloudFront's 30GB per-object cap.
+#   6. Upload with immutable Cache-Control; write a manifest fragment.
 # A full run then assembles routing-manifest.json (assemble-manifest.sh).
+#
+# Each region is built over its *extent* bbox (ownership bbox + OVERLAP_DEG
+# margin) so chunked regions are ready for multi-archive reads. See
+# docs/regional-chunking.md.
 #
 # COST NOTE: these are heavy. The continent extracts are large (europe ~28GB,
 # asia ~13GB) and tilemaker reads every node in the input. Budget tens of
-# minutes and tens of GB of scratch per region; the CI workflow shards one
-# region per runner and frees disk first.
+# minutes and tens of GB of scratch per region; CI shards one region per runner
+# and frees disk first.
 #
-# Runs whole or sharded, mirroring deploy-tiles.sh:
+# Runs whole or sharded, mirroring build-display.sh:
 #   ONLY_REGION     build just this region id (default: all in REGIONS_FILE)
 #   EMIT_MANIFEST   0 to skip the manifest (matrix shards); default 1
 #   FRAGMENT_DIR    where per-region manifest fragments are written
@@ -33,16 +38,18 @@
 #   SKIP_UPLOAD     1 to build PMTiles into OUT_DIR without touching S3 (local
 #                   iteration; implies no manifest, and aws creds not required)
 #   OUT_DIR         where SKIP_UPLOAD writes archives (default ./routing-tiles-out)
-#   PROGRESS_SAMPLE echo every Nth tilemaker log line as progress (default 10; 0 = silent)
-#                   (downloads print their own periodic MB/percent line)
+#   PROGRESS_SAMPLE echo every Nth tilemaker log line (default 10; 0 = silent)
 
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tiles/lib.sh
+. "$SCRIPT_DIR/lib.sh"
+cd "$SCRIPT_DIR/.."
 
 # tilemaker isn't a Homebrew/apt formula — build it from source or use the
 # official Docker image (see the install hint below / CLAUDE.md). Override with
 # an explicit path when you built it without `make install`, e.g.
-#   TILEMAKER=./tilemaker/tilemaker ./deploy-routing-tiles.sh
+#   TILEMAKER=./tilemaker/tilemaker tiles/build-routing.sh
 TILEMAKER="${TILEMAKER:-tilemaker}"
 ZOOM="${ZOOM:-13}"
 S3_PREFIX="${S3_PREFIX:-s3://alex-knowlton/pictomap/tiles}"
@@ -55,20 +62,7 @@ ONLY_REGION="${ONLY_REGION:-}"
 SKIP_UPLOAD="${SKIP_UPLOAD:-0}"
 OUT_DIR="${OUT_DIR:-./routing-tiles-out}"
 MANIFEST_NAME="${MANIFEST_NAME:-routing-manifest.json}"
-MAX_BYTES=32212254720   # 30 * 1024^3 — CloudFront's per-object response cap
-PROGRESS_SAMPLE="${PROGRESS_SAMPLE:-10}"
-
-# Stream a long, chatty command: full output to a log (surfaced on failure),
-# plus every PROGRESS_SAMPLE-th line echoed to the terminal so downloads and
-# tilemaker show progress without their full flood. pipefail (set above) keeps
-# the wrapped command's exit status.
-run_logged() {
-  local log="$1"; shift
-  "$@" 2>&1 | tee "$log" | awk -v n="$PROGRESS_SAMPLE" \
-    'n > 0 && NR % n == 0 { print "      " $0; fflush() }'
-}
-
-# Geofabrik publishes "-latest" extracts, so the build date is just today.
+# Geofabrik publishes "-latest" extracts, so the version stamp is just today.
 BUILD_DATE="${BUILD_DATE:-$(date -u +%Y%m%d)}"
 
 TMP_DIR="$(mktemp -d)"
@@ -78,7 +72,8 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 FRAGMENT_DIR="${FRAGMENT_DIR:-$TMP_DIR/fragments}"
 mkdir -p "$FRAGMENT_DIR"
 
-# tilemaker may be a PATH command or an explicit path (the TILEMAKER override).
+# tilemaker may be a PATH command or an explicit path (the TILEMAKER override);
+# its install hint is multi-line, so check it separately from require_cmds.
 if ! command -v "$TILEMAKER" >/dev/null 2>&1; then
   echo "missing dependency: tilemaker (\`$TILEMAKER\` not found)" >&2
   echo "  tilemaker has no brew/apt formula — install one of:" >&2
@@ -90,18 +85,8 @@ if ! command -v "$TILEMAKER" >/dev/null 2>&1; then
 fi
 
 # aws is only needed when publishing; SKIP_UPLOAD builds offline.
-DEPS="osmium curl jq"
-[ "$SKIP_UPLOAD" = "1" ] || DEPS="$DEPS aws"
-for cmd in $DEPS; do
-  if ! command -v "$cmd" >/dev/null; then
-    echo "missing dependency: $cmd" >&2
-    case "$cmd" in
-      osmium) echo "  install with: brew install osmium-tool" >&2 ;;
-      jq)     echo "  install with: brew install jq" >&2 ;;
-    esac
-    exit 1
-  fi
-done
+require_cmds osmium curl jq
+[ "$SKIP_UPLOAD" = "1" ] || require_cmds aws
 
 for f in "$REGIONS_FILE" "$SOURCES_FILE" "$TILEMAKER_CONFIG" "$TILEMAKER_PROCESS"; do
   if [ ! -f "$f" ]; then
@@ -110,17 +95,7 @@ for f in "$REGIONS_FILE" "$SOURCES_FILE" "$TILEMAKER_CONFIG" "$TILEMAKER_PROCESS
   fi
 done
 
-# Build every region, or just one (matrix shard) when ONLY_REGION is set.
-if [ -n "$ONLY_REGION" ]; then
-  REGIONS_JSON=$(jq -c --arg id "$ONLY_REGION" '[.[] | select(.id == $id)]' "$REGIONS_FILE")
-  if [ "$(jq 'length' <<<"$REGIONS_JSON")" -eq 0 ]; then
-    echo "ONLY_REGION='$ONLY_REGION' not found in $REGIONS_FILE" >&2
-    exit 1
-  fi
-else
-  REGIONS_JSON=$(jq -c '.' "$REGIONS_FILE")
-fi
-
+REGIONS_JSON=$(select_regions "$REGIONS_FILE" "$ONLY_REGION")
 REGION_COUNT=$(jq 'length' <<<"$REGIONS_JSON")
 echo "Build date: $BUILD_DATE"
 echo "Zoom:       z${ZOOM} (high-resolution extent ~= z14 ground precision)"
@@ -133,6 +108,7 @@ while IFS= read -r region; do
   REGION_ID=$(jq -r '.id' <<<"$region")
   REGION_NAME=$(jq -r '.name' <<<"$region")
   BBOX=$(jq -r '.bbox | join(",")' <<<"$region")
+  EXTENT_BBOX=$(expand_bbox "$BBOX" "$OVERLAP_DEG")
 
   # Source extract URLs for this region (bash 3.2-safe array build — no mapfile).
   SOURCES=()
@@ -144,7 +120,7 @@ while IFS= read -r region; do
     exit 1
   fi
 
-  echo "[${i}/${REGION_COUNT}] ${REGION_NAME} (${BBOX}) — ${#SOURCES[@]} source(s)"
+  echo "[${i}/${REGION_COUNT}] ${REGION_NAME} (extent ${EXTENT_BBOX}) — ${#SOURCES[@]} source(s)"
 
   # 1. Download.
   LOCAL_FILES=()
@@ -165,7 +141,7 @@ while IFS= read -r region; do
     curl -fSL --retry 3 --retry-delay 5 -o "$f" "$url" 2>"$DL_LOG" &
     dlpid=$!
     while kill -0 "$dlpid" 2>/dev/null; do
-      cur=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+      cur=$(file_size "$f" 2>/dev/null || echo 0)
       if [ "$TOTAL" -gt 0 ]; then
         echo "      ${REGION_ID} src${n}: $((cur / 1048576)) / $((TOTAL / 1048576)) MB ($((cur * 100 / TOTAL))%)"
       else
@@ -192,23 +168,23 @@ while IFS= read -r region; do
     INPUT="${LOCAL_FILES[0]}"
   fi
 
-  # 2.5 Pre-filter to highways before tilemaker. process.lua keeps only highway=
-  #     ways, but tilemaker still *reads* — and builds an on-disk node store over
-  #     — every building/landuse/waterway node in the whole continent first
-  #     (that's the 30GB+ store and the multi-hour read seen in the logs). osmium
-  #     strips all of it in one streaming pass; matched ways keep their referenced
-  #     nodes (osmium's default, so geometry survives) plus the bridge/tunnel/
-  #     layer tags the schema reads — so tilemaker emits the same `roads` tiles
-  #     from a small fraction of the data, and its store no longer spills to disk.
-  #     The construction/raceway/etc. highway values this passes through are still
-  #     dropped by process.lua's ROAD_KINDS gate.
+  # 3. Pre-filter to highways before tilemaker. process.lua keeps only highway=
+  #    ways, but tilemaker still *reads* — and builds an on-disk node store over
+  #    — every building/landuse/waterway node in the whole continent first
+  #    (that's the 30GB+ store and the multi-hour read seen in the logs). osmium
+  #    strips all of it in one streaming pass; matched ways keep their referenced
+  #    nodes (osmium's default, so geometry survives) plus the bridge/tunnel/
+  #    layer tags the schema reads — so tilemaker emits the same `roads` tiles
+  #    from a small fraction of the data, and its store no longer spills to disk.
+  #    The construction/raceway/etc. highway values this passes through are still
+  #    dropped by process.lua's ROAD_KINDS gate.
   FILTERED="${TMP_DIR}/${REGION_ID}-roads.osm.pbf"
   echo "    osmium tags-filter -> highways only"
   osmium tags-filter "$INPUT" w/highway -o "$FILTERED" --overwrite
   rm -f "$INPUT"            # reclaim the full extract before tilemaker
   INPUT="$FILTERED"
 
-  # 3. tilemaker -> PMTiles. --store keeps the node index on disk so large
+  # 4. tilemaker -> PMTiles. --store keeps the node index on disk so large
   #    continents stay within the RAM budget. Chatty on stderr; run_logged
   #    samples it to the terminal and keeps the full log to surface on failure.
   OUTPUT_NAME="pictomap-routing-${REGION_ID}-${BUILD_DATE}-z${ZOOM}.pmtiles"
@@ -222,7 +198,7 @@ while IFS= read -r region; do
       --output "$OUTPUT_PATH" \
       --config "$TILEMAKER_CONFIG" \
       --process "$TILEMAKER_PROCESS" \
-      --bbox "$BBOX" \
+      --bbox "$EXTENT_BBOX" \
       --store "$STORE_DIR"; then
     cat "$TM_LOG" >&2
     exit 1
@@ -230,36 +206,21 @@ while IFS= read -r region; do
   rm -f "$INPUT"
   rm -rf "$STORE_DIR"
 
-  SIZE_BYTES=$(stat -f%z "$OUTPUT_PATH" 2>/dev/null || stat -c%s "$OUTPUT_PATH")
-  SIZE_HUMAN=$(du -h "$OUTPUT_PATH" | cut -f1)
-  echo "    -> ${OUTPUT_NAME} (${SIZE_HUMAN})"
-
-  if [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
-    echo "    ERROR: region exceeds 30GB CloudFront limit — split this region's bbox in tiles/regions.json" >&2
-    exit 1
-  fi
+  SIZE_BYTES=$(file_size "$OUTPUT_PATH")
+  echo "    -> ${OUTPUT_NAME} ($(du -h "$OUTPUT_PATH" | cut -f1))"
+  check_size_cap "$SIZE_BYTES"
 
   if [ "$SKIP_UPLOAD" = "1" ]; then
     mkdir -p "$OUT_DIR"
     mv "$OUTPUT_PATH" "${OUT_DIR}/${OUTPUT_NAME}"
     echo "    (SKIP_UPLOAD) saved ${OUT_DIR}/${OUTPUT_NAME}"
   else
-    aws s3 cp "$OUTPUT_PATH" "${S3_PREFIX}/${OUTPUT_NAME}" \
-      --content-type application/octet-stream \
-      --cache-control "public, max-age=31536000, immutable" \
-      --only-show-errors
+    upload_archive "$OUTPUT_PATH" "${S3_PREFIX}/${OUTPUT_NAME}"
     rm -f "$OUTPUT_PATH"
   fi
 
-  # Bare filename so the app resolves the URL relative to routing-manifest.json
-  # (same scheme as the display manifest). One fragment per region; merged below.
-  jq -n \
-    --argjson region "$region" \
-    --arg filename "$OUTPUT_NAME" \
-    --argjson size "$SIZE_BYTES" \
-    '$region + {filename: $filename, sizeBytes: $size}' \
-    > "${FRAGMENT_DIR}/${REGION_ID}.json"
-
+  write_fragment "$region" "$EXTENT_BBOX" "$OUTPUT_NAME" "$SIZE_BYTES" \
+    "${FRAGMENT_DIR}/${REGION_ID}.json"
   echo
 done < <(jq -c '.[]' <<<"$REGIONS_JSON")
 
@@ -278,4 +239,4 @@ fi
 MIN_ZOOM="$ZOOM" MAX_ZOOM="$ZOOM" SOURCE_DATE="$BUILD_DATE" \
 S3_PREFIX="$S3_PREFIX" REGIONS_FILE="$REGIONS_FILE" FRAGMENT_DIR="$FRAGMENT_DIR" \
 MANIFEST_NAME="$MANIFEST_NAME" \
-  ./assemble-manifest.sh
+  "$SCRIPT_DIR/assemble-manifest.sh"

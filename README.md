@@ -25,9 +25,10 @@ Open the printed `https://localhost:<port>` URL. **HTTPS is required** — the d
 
 ## Tile data
 
-Tiles are split into regional PMTiles archives (see `tiles/regions.json`) and a `manifest.json` at a stable URL. The app fetches the manifest at startup, geolocates, and picks the region whose bbox contains the user. Each regional archive must stay under CloudFront's 30GB per-object response cap — `deploy-tiles.sh` fails loudly otherwise so we know to split the bbox further.
+Tiles are split into regional PMTiles archives (see `tiles/regions.json`) and a `manifest.json` at a stable URL. The app fetches the manifest at startup, geolocates, and picks the region whose bbox contains the user. Each regional archive must stay under CloudFront's 30GB per-object response cap — `tiles/build-display.sh` fails loudly otherwise so we know to split the bbox further.
 
-- `./deploy-tiles.sh` — extract regions from Protomaps' daily planet build via `pmtiles extract --bbox=`, upload to S3, refresh the manifest. Also runs weekly via `.github/workflows/deploy-tiles.yml`.
+- `./tiles/build-display.sh` — extract regions from Protomaps' daily planet build via `pmtiles extract --bbox=`, upload to S3, refresh the manifest. Also runs weekly via `.github/workflows/deploy-tiles.yml` (which calls the reusable `tiles-pipeline.yml`).
+- `./tiles/build-routing.sh` — build the routing PMTiles from raw OSM (Geofabrik → `tilemaker`), upload to S3, refresh `routing-manifest.json`. Weekly via `.github/workflows/deploy-routing-tiles.yml`. See `CLAUDE.md` for the tilemaker install.
 - `VITE_TILES_MANIFEST_URL` — optional override, defaults to `/tiles/manifest.json`. Vite proxies `/tiles/*` to prod CloudFront so the default works in dev.
 
 ## Stack

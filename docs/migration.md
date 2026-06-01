@@ -11,10 +11,10 @@ records the decision factors so we don't re-derive them later.
 Pictomap serves large static PMTiles archives over HTTP range requests; there's
 no tile server. Two pipelines write to `s3://alex-knowlton/pictomap/tiles/`:
 
-- **Display tiles** (`deploy-tiles.sh`) — regional Protomaps subsets, z12–14,
-  all layers. Large; the per-region build hard-fails above **30 GB** (a
+- **Display tiles** (`tiles/build-display.sh`) — regional Protomaps subsets,
+  z12–14, all layers. Large; the per-region build hard-fails above **30 GB** (a
   *CloudFront* per-object response cap).
-- **Routing tiles** (`deploy-routing-tiles.sh`) — custom roads + ped paths, one
+- **Routing tiles** (`tiles/build-routing.sh`) — custom roads + ped paths, one
   high-resolution zoom. Much smaller (roads-only, single zoom).
 
 Both are date-versioned and immutable, retained ~3 generations by the bucket's
@@ -54,8 +54,9 @@ absolute dollars. The large swing is egress at scale: 1 TB/mo of serving is
    component — object store + CDN is the canonical pattern, and Protomaps
    explicitly documents R2/B2. Range requests work on all three.
 2. **The deploy scripts already speak S3.** R2 and B2 expose S3-compatible APIs,
-   so `deploy-tiles.sh` / `deploy-routing-tiles.sh` change by ~one line each
-   (endpoint + credentials on `aws s3 cp`; `assemble-manifest.sh` likewise).
+   so the `aws s3 cp` calls (now centralized in `tiles/lib.sh`'s `upload_archive`,
+   plus `tiles/assemble-manifest.sh`) change by ~one line each — endpoint +
+   credentials.
 3. **Manifest-relative URLs.** Clients resolve tile filenames relative to the
    manifest URL, so re-pointing `/tiles/*` at a new origin needs no app change.
 4. **The 30 GB cap is CloudFront-specific** and relaxes off CloudFront (R2/B2
@@ -99,7 +100,7 @@ generation listed in the manifest.
 
 ## References
 
-- `deploy-tiles.sh`, `deploy-routing-tiles.sh`, `assemble-manifest.sh` — upload pipelines.
+- `tiles/build-display.sh`, `tiles/build-routing.sh`, `tiles/assemble-manifest.sh`, `tiles/lib.sh` — upload pipelines + shared scaffolding.
 - `src/lib/tiles/manifest.ts` — manifest fetch + manifest-relative URL resolution.
 - [`docs/tasks.md`](./tasks.md) — overall architecture and roadmap.
 - `CLAUDE.md` § Deployment / Tiles architecture.

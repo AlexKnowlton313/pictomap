@@ -1,40 +1,22 @@
-# Weekly: extract regional PMTiles archives from Protomaps' daily planet build
-# and upload them to S3, plus a manifest.json at a stable URL listing every
-# region. Date-versioned objects, immutable cache, no invalidation needed —
-# the app fetches the manifest at runtime and picks a region by geolocation,
-# so tile refreshes don't require an app redeploy.
-#
-# Regions are defined in tiles/regions.json. Each must stay under CloudFront's
-# 30GB per-object cap; the script hard-fails if any region exceeds it.
-#
-# Sharded across runners: `setup` resolves the source date + region list once,
-# `build` extracts/uploads one region per runner in parallel (each gets its own
-# full disk, sidestepping the single-runner disk limit) and emits a manifest
-# fragment, and `assemble` merges the fragments into manifest.json.
-#
-# One-time AWS setup:
-#   1. Same OIDC provider as deploy.yml.
-#   2. Create an IAM role assumable by repo:AlexKnowlton313/pictomap:* with
-#      s3:PutObject on arn:aws:s3:::alex-knowlton/pictomap/tiles/*.
-#      Store the role ARN as repo secret AWS_TILES_ROLE_ARN.
-#      (Reusing AWS_DEPLOY_ROLE_ARN is fine if you'd rather not split roles.)
+# Weekly: extract regional DISPLAY (basemap) PMTiles from Protomaps' daily
+# planet build and publish them + manifest.json. All the build mechanics live in
+# the reusable tiles-pipeline.yml; this file is just the schedule/dispatch entry
+# point and the display-specific inputs.
 
 name: Deploy tiles
 
 on:
   schedule:
-    # Mondays at 07:00 UTC. Protomaps builds publish daily ~06:00 UTC, so by
-    # the time this runs "yesterday's" build is reliably available.
+    # Mondays 07:00 UTC. Protomaps builds publish daily ~06:00 UTC, so by now
+    # "yesterday's" build is reliably available.
     - cron: '0 7 * * 1'
   workflow_dispatch:
     inputs:
       min_zoom:
         description: Minimum zoom level
-        required: false
         default: '12'
       max_zoom:
         description: Maximum zoom level
-        required: false
         default: '14'
       source_date:
         description: Source build date YYYYMMDD (blank = yesterday UTC)
@@ -44,145 +26,24 @@ concurrency:
   group: deploy-tiles
   cancel-in-progress: false
 
-permissions:
-  id-token: write
-  contents: read
-
 jobs:
-  # Resolve the source date, zooms, and region matrix ONCE so every shard
-  # agrees (a build straddling UTC midnight must not split across two dates),
-  # and fail fast if the Protomaps build for that date isn't reachable.
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      source_date: ${{ steps.meta.outputs.source_date }}
-      min_zoom: ${{ steps.meta.outputs.min_zoom }}
-      max_zoom: ${{ steps.meta.outputs.max_zoom }}
-      regions: ${{ steps.meta.outputs.regions }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Resolve build metadata
-        id: meta
-        env:
-          MIN_ZOOM: ${{ inputs.min_zoom || '12' }}
-          MAX_ZOOM: ${{ inputs.max_zoom || '14' }}
-          SOURCE_DATE_INPUT: ${{ inputs.source_date }}
-        run: |
-          set -euo pipefail
-          SOURCE_DATE="$SOURCE_DATE_INPUT"
-          [ -z "$SOURCE_DATE" ] && SOURCE_DATE="$(date -u -d 'yesterday' +%Y%m%d)"
-          SOURCE_URL="https://build.protomaps.com/${SOURCE_DATE}.pmtiles"
-          if ! curl -sfI "$SOURCE_URL" >/dev/null; then
-            echo "Source not reachable: $SOURCE_URL" >&2
-            echo "Pick a recent date from https://build.protomaps.com/ and re-run with source_date." >&2
-            exit 1
-          fi
-          REGIONS=$(jq -c '[.[].id]' tiles/regions.json)
-          {
-            echo "source_date=$SOURCE_DATE"
-            echo "min_zoom=$MIN_ZOOM"
-            echo "max_zoom=$MAX_ZOOM"
-            echo "regions=$REGIONS"
-          } >> "$GITHUB_OUTPUT"
-          echo "Source $SOURCE_URL OK; regions=$REGIONS"
-
-  # One region per runner. fail-fast: false so a single region's failure doesn't
-  # cancel the others (you still see which succeeded); assemble needs the whole
-  # build job to pass, so a failure prevents a partial manifest.
-  #
-  # max-parallel caps how many shards range-read the *same* Protomaps source
-  # object at once. All shards pull from one daily .pmtiles, and the origin
-  # throttles aggregate throughput to it: 8 shards x DOWNLOAD_THREADS connections
-  # starve each other, hitting the densest regions (na, eu) hardest. 4 shards x
-  # 4 threads keeps per-shard extract near its standalone speed while still
-  # finishing in ~two waves instead of serially.
-  build:
-    needs: setup
-    runs-on: ubuntu-latest
-    # A healthy shard finishes in <10 min (heaviest serial extract ~3.5 min +
-    # upload + setup). Cap at 20 so a throttled shard fails fast instead of
-    # dragging toward the old 90-min limit with no visible progress.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        region: ${{ fromJson(needs.setup.outputs.regions) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      # Standard runners ship with ~14GB free of 80GB. A single region's
-      # extract (largest is East Asia + N Eurasia) can approach the 30GB cap,
-      # so reclaim disk.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: false
-
-      - name: Install pmtiles CLI
-        run: |
-          set -euo pipefail
-          VERSION=1.22.2
-          curl -fsSL -o pmtiles.tar.gz \
-            "https://github.com/protomaps/go-pmtiles/releases/download/v${VERSION}/go-pmtiles_${VERSION}_Linux_x86_64.tar.gz"
-          tar -xzf pmtiles.tar.gz pmtiles
-          sudo mv pmtiles /usr/local/bin/
-          pmtiles version
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
-          aws-region: us-east-1
-
-      - name: Build & upload ${{ matrix.region }}
-        env:
-          ONLY_REGION: ${{ matrix.region }}
-          SOURCE_DATE: ${{ needs.setup.outputs.source_date }}
-          MIN_ZOOM: ${{ needs.setup.outputs.min_zoom }}
-          MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
-          EMIT_MANIFEST: '0'
-          FRAGMENT_DIR: ${{ github.workspace }}/fragments
-          # Keep low: with several shards reading the same source object,
-          # per-shard threads multiply load on the shared origin (see max-parallel).
-          DOWNLOAD_THREADS: '4'
-        run: ./deploy-tiles.sh
-
-      - name: Upload manifest fragment
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest-fragment-${{ matrix.region }}
-          path: fragments/${{ matrix.region }}.json
-          retention-days: 1
-          if-no-files-found: error
-
-  # Gather every shard's fragment and publish the merged manifest.json.
-  assemble:
-    needs: [setup, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: fragments
-          pattern: manifest-fragment-*
-          merge-multiple: true
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
-          aws-region: us-east-1
-
-      - name: Assemble & upload manifest
-        env:
-          SOURCE_DATE: ${{ needs.setup.outputs.source_date }}
-          MIN_ZOOM: ${{ needs.setup.outputs.min_zoom }}
-          MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
-          FRAGMENT_DIR: ${{ github.workspace }}/fragments
-        run: ./assemble-manifest.sh
+  tiles:
+    uses: ./.github/workflows/tiles-pipeline.yml
+    permissions:
+      id-token: write
+      contents: read
+    secrets: inherit
+    with:
+      script: tiles/build-display.sh
+      manifest_name: manifest.json
+      fragment_prefix: display
+      tools: pmtiles
+      min_zoom: ${{ inputs.min_zoom || '12' }}
+      max_zoom: ${{ inputs.max_zoom || '14' }}
+      date_offset: yesterday
+      date_override: ${{ inputs.source_date }}
+      check_source_base: https://build.protomaps.com
+      # A healthy display shard finishes in <10 min; cap at 20 so a throttled
+      # shard fails fast instead of dragging on with no visible progress.
+      build_timeout: 20
+      download_threads: '4'

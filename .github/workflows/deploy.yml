@@ -47,6 +47,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1
 
-      - run: ./deploy.sh
+      - run: ./scripts/deploy-app.sh
         env:
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}

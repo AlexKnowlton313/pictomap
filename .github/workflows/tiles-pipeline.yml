@@ -1,0 +1,256 @@
+# Reusable pipeline shared by deploy-tiles.yml (display basemap) and
+# deploy-routing-tiles.yml (routing graph source). Both build regional PMTiles
+# the same way — only the source, tooling, schema and manifest differ — so the
+# three-job shape lives here once and each caller passes its differences as
+# inputs.
+#
+#   setup    — resolve the version date + zoom range + region matrix ONCE so
+#              every shard agrees (a build straddling UTC midnight must not split
+#              across two dates), and optionally fail fast if the upstream source
+#              for that date isn't reachable.
+#   build    — one region per runner (matrix), each on its own full disk. Frees
+#              disk, installs the right tool, runs the caller's build script with
+#              ONLY_REGION + EMIT_MANIFEST=0, and uploads a manifest fragment.
+#   assemble — merges the fragments into the manifest at a stable URL.
+#
+# Date-versioned objects + immutable cache => no CloudFront invalidation; the app
+# fetches the manifest at runtime and picks a region by geolocation, so tile
+# refreshes never require an app redeploy. Each archive must stay under
+# CloudFront's 30GB per-object cap; the build scripts hard-fail otherwise.
+#
+# One-time AWS setup (shared with deploy.yml's OIDC provider):
+#   Create an IAM role assumable by repo:AlexKnowlton313/pictomap:* with
+#   s3:PutObject on arn:aws:s3:::alex-knowlton/pictomap/tiles/*; store its ARN as
+#   repo secret AWS_TILES_ROLE_ARN. For role_duration > 3600 (routing), the
+#   role's MaxSessionDuration must be raised once:
+#     aws iam update-role --role-name <role> --max-session-duration 14400
+
+name: Tiles pipeline (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      script:
+        description: Build script to run per region (tiles/build-display.sh | tiles/build-routing.sh)
+        required: true
+        type: string
+      manifest_name:
+        description: Published manifest filename (manifest.json | routing-manifest.json)
+        required: true
+        type: string
+      fragment_prefix:
+        description: Artifact-name prefix for per-region manifest fragments (display | routing)
+        required: true
+        type: string
+      tools:
+        description: Which tool to install on the build runner (pmtiles | osm)
+        required: true
+        type: string
+      min_zoom:
+        description: Minimum publish zoom
+        required: true
+        type: string
+      max_zoom:
+        description: Maximum publish zoom
+        required: true
+        type: string
+      date_offset:
+        description: How to derive the version date when date_override is blank (yesterday | today)
+        default: yesterday
+        type: string
+      date_override:
+        description: Explicit version date YYYYMMDD (blank = derive from date_offset)
+        default: ''
+        type: string
+      check_source_base:
+        description: If set, fail fast unless <base>/<date>.pmtiles is reachable (display only)
+        default: ''
+        type: string
+      build_timeout:
+        description: Per-region build job timeout (minutes)
+        default: 30
+        type: number
+      download_threads:
+        description: Parallel range-request threads for pmtiles extract (display only)
+        default: '4'
+        type: string
+      free_aggressive:
+        description: Also free large packages + swap (needed for the heavy routing builds)
+        default: false
+        type: boolean
+      role_duration:
+        description: AWS session lifetime (seconds); raise for builds that run past 1h
+        default: 3600
+        type: number
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      date: ${{ steps.meta.outputs.date }}
+      min_zoom: ${{ steps.meta.outputs.min_zoom }}
+      max_zoom: ${{ steps.meta.outputs.max_zoom }}
+      regions: ${{ steps.meta.outputs.regions }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve build metadata
+        id: meta
+        env:
+          MIN_ZOOM: ${{ inputs.min_zoom }}
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+          DATE_OFFSET: ${{ inputs.date_offset }}
+          DATE_OVERRIDE: ${{ inputs.date_override }}
+          CHECK_SOURCE_BASE: ${{ inputs.check_source_base }}
+        run: |
+          set -euo pipefail
+          DATE="$DATE_OVERRIDE"
+          if [ -z "$DATE" ]; then
+            if [ "$DATE_OFFSET" = "yesterday" ]; then
+              DATE="$(date -u -d 'yesterday' +%Y%m%d)"
+            else
+              DATE="$(date -u +%Y%m%d)"
+            fi
+          fi
+          if [ -n "$CHECK_SOURCE_BASE" ]; then
+            URL="${CHECK_SOURCE_BASE}/${DATE}.pmtiles"
+            if ! curl -sfI "$URL" >/dev/null; then
+              echo "Source not reachable: $URL" >&2
+              echo "Pick a recent date from $CHECK_SOURCE_BASE and re-run with date_override." >&2
+              exit 1
+            fi
+            echo "Source $URL OK"
+          fi
+          REGIONS=$(jq -c '[.[].id]' tiles/regions.json)
+          {
+            echo "date=$DATE"
+            echo "min_zoom=$MIN_ZOOM"
+            echo "max_zoom=$MAX_ZOOM"
+            echo "regions=$REGIONS"
+          } >> "$GITHUB_OUTPUT"
+          echo "date=$DATE zooms=z${MIN_ZOOM}-z${MAX_ZOOM} regions=$REGIONS"
+
+  # One region per runner. fail-fast: false so one region's failure doesn't
+  # cancel the others; assemble still needs the whole build job to pass, so a
+  # failure prevents a partial manifest.
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.build_timeout }}
+    strategy:
+      fail-fast: false
+      # Cap shards reading the same upstream at once: the display pipeline range-
+      # reads one Protomaps daily object (its origin throttles aggregate
+      # throughput); the routing pipeline pulls from the Geofabrik mirror. 4
+      # keeps each shard near standalone speed while finishing in ~two waves.
+      max-parallel: 4
+      matrix:
+        region: ${{ fromJson(needs.setup.outputs.regions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Standard runners ship ~14GB free of 80GB; a single region's archive can
+      # approach the 30GB cap, and the routing node store needs much more, so
+      # reclaim disk. free_aggressive adds large-packages + swap for routing.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: ${{ inputs.free_aggressive }}
+          swap-storage: ${{ inputs.free_aggressive }}
+
+      - name: Install pmtiles CLI
+        if: inputs.tools == 'pmtiles'
+        run: |
+          set -euo pipefail
+          VERSION=1.22.2
+          curl -fsSL -o pmtiles.tar.gz \
+            "https://github.com/protomaps/go-pmtiles/releases/download/v${VERSION}/go-pmtiles_${VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf pmtiles.tar.gz pmtiles
+          sudo mv pmtiles /usr/local/bin/
+          pmtiles version
+
+      - name: Install osmium + tilemaker (official Docker image)
+        if: inputs.tools == 'osm'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends osmium-tool
+          # tilemaker has no apt/brew formula; use the maintainers' image rather
+          # than a fragile from-source build. `:master` because the profile's
+          # `high_resolution` config key predates any tagged release. A thin
+          # wrapper on PATH lets build-routing.sh call `tilemaker` unchanged;
+          # mounting /tmp (mktemp scratch) and the workspace at their real paths
+          # makes the script's absolute + relative paths resolve identically
+          # inside the container.
+          docker pull ghcr.io/systemed/tilemaker:master
+          # $PWD / $@ are intentionally literal — they must expand when the
+          # wrapper runs, not now while writing it.
+          # shellcheck disable=SC2016
+          {
+            echo '#!/usr/bin/env bash'
+            echo 'exec docker run --rm -v /tmp:/tmp -v "$PWD:$PWD" -w "$PWD" ghcr.io/systemed/tilemaker:master "$@"'
+          } | sudo tee /usr/local/bin/tilemaker >/dev/null
+          sudo chmod +x /usr/local/bin/tilemaker
+          tilemaker --version || true
+          osmium --version
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
+          aws-region: us-east-1
+          role-duration-seconds: ${{ inputs.role_duration }}
+
+      # The build scripts read whichever of these vars they need and ignore the
+      # rest (display: SOURCE_DATE/MIN_ZOOM/MAX_ZOOM/DOWNLOAD_THREADS;
+      # routing: BUILD_DATE/ZOOM). Passing the superset keeps this step generic.
+      - name: Build & upload ${{ matrix.region }}
+        env:
+          ONLY_REGION: ${{ matrix.region }}
+          EMIT_MANIFEST: '0'
+          FRAGMENT_DIR: ${{ github.workspace }}/fragments
+          SOURCE_DATE: ${{ needs.setup.outputs.date }}
+          BUILD_DATE: ${{ needs.setup.outputs.date }}
+          MIN_ZOOM: ${{ needs.setup.outputs.min_zoom }}
+          MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
+          ZOOM: ${{ needs.setup.outputs.min_zoom }}
+          DOWNLOAD_THREADS: ${{ inputs.download_threads }}
+        run: ${{ inputs.script }}
+
+      - name: Upload manifest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.fragment_prefix }}-fragment-${{ matrix.region }}
+          path: fragments/${{ matrix.region }}.json
+          retention-days: 1
+          if-no-files-found: error
+
+  assemble:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: fragments
+          pattern: ${{ inputs.fragment_prefix }}-fragment-*
+          merge-multiple: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TILES_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Assemble & upload manifest
+        env:
+          SOURCE_DATE: ${{ needs.setup.outputs.date }}
+          MIN_ZOOM: ${{ needs.setup.outputs.min_zoom }}
+          MAX_ZOOM: ${{ needs.setup.outputs.max_zoom }}
+          MANIFEST_NAME: ${{ inputs.manifest_name }}
+          FRAGMENT_DIR: ${{ github.workspace }}/fragments
+        run: tiles/assemble-manifest.sh

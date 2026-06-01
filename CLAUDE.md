@@ -13,9 +13,13 @@ npm run dev          # HTTPS dev server (HMR). HTTPS is required — see below.
 npm run check        # svelte-check + TypeScript type-check, no build
 npm run build        # type-check, then produce dist/
 npm run preview      # serve the built dist/ locally
-./deploy.sh          # build + sync dist/ to S3 + invalidate CloudFront (prod)
-./deploy-tiles.sh    # extract regional PMTiles + manifest, upload to S3
+./scripts/deploy-app.sh   # build + sync dist/ to S3 + invalidate CloudFront (prod)
+./tiles/build-display.sh  # extract regional display PMTiles + manifest, upload to S3
+./tiles/build-routing.sh  # build regional routing PMTiles + manifest from raw OSM
 ```
+
+Deploy/build scripts live next to what they touch: the app deploy in `scripts/`,
+the tile pipelines in `tiles/` (sharing `tiles/lib.sh` and `tiles/assemble-manifest.sh`).
 
 There is no test runner configured. Verification is manual (run the app, drag an image, watch the matcher log).
 
@@ -95,15 +99,17 @@ Don't mix these. The boundaries are: `projectContourToLngLat` (pixel → lng/lat
 
 Three independent pipelines:
 
-- **App** (`./deploy.sh`, GitHub Actions `deploy.yml` on push to main): builds and syncs to `s3://alex-knowlton/pictomap/`, invalidates CloudFront. Doesn't bake in tile URLs — the app fetches the manifest at runtime.
-- **Display tiles** (`./deploy-tiles.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL. These drive the **MapLibre basemap** only.
-- **Routing tiles** (`./deploy-routing-tiles.sh`, GitHub Actions `deploy-routing-tiles.yml` weekly): generates a custom roads+paths tileset from raw OSM (Geofabrik extracts → optional `osmium merge` → `tilemaker`) and writes `routing-manifest.json`. These drive the **road graph** — see below.
+- **App** (`./scripts/deploy-app.sh`, GitHub Actions `deploy.yml` on push to main): builds and syncs to `s3://alex-knowlton/pictomap/`, invalidates CloudFront. Doesn't bake in tile URLs — the app fetches the manifest at runtime.
+- **Display tiles** (`./tiles/build-display.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL. These drive the **MapLibre basemap** only.
+- **Routing tiles** (`./tiles/build-routing.sh`, GitHub Actions `deploy-routing-tiles.yml` weekly): generates a custom roads+paths tileset from raw OSM (Geofabrik extracts → optional `osmium merge` → `tilemaker`) and writes `routing-manifest.json`. These drive the **road graph** — see below.
+
+Both tile pipelines share the same three-job shape (resolve metadata → sharded per-region build → assemble manifest) via the reusable `.github/workflows/tiles-pipeline.yml`, and the same shell scaffolding via `tiles/lib.sh`; `deploy-tiles.yml`/`deploy-routing-tiles.yml` are thin callers that pass their differences (source, tooling, schema, manifest name) as inputs.
 
 Tile hosting cost / cheaper-host options (Cloudflare R2, Backblaze B2) are evaluated in [`docs/migration.md`](docs/migration.md).
 
 ### Tiles architecture
 
-Regions are defined in `tiles/regions.json` (id, name, bbox per region). The build script hard-fails if any region exceeds **30GB** (CloudFront's per-object response cap) — split that region's bbox into smaller pieces when this happens. The app:
+Regions are defined in `tiles/regions.json` (id, name, ownership bbox per region). Dense continents are split into chunks with partitioning bboxes (`na-w`/`na-c`/`na-e`, `eu-w`/`eu-e`) to stay under the 30GB cap and keep routing builds fast. The build scripts extract each region over its *extent* bbox (ownership bbox + a small overlap margin, `OVERLAP_DEG` in `tiles/lib.sh`) and emit that `extentBbox` into the manifest; the current client still selects + locks `maxBounds` by ownership `bbox` and ignores `extentBbox` (it exists so chunked regions are ready for multi-archive reads — see [`docs/regional-chunking.md`](docs/regional-chunking.md)). The build still hard-fails if any region exceeds **30GB** (CloudFront's per-object response cap) — split that region's bbox into smaller pieces when this happens. The app:
 
 1. Fetches `/tiles/manifest.json` at startup.
 2. Geolocates the user (falls back to Manhattan).
@@ -128,4 +134,4 @@ The display basemap is generalized for cartography — it quantizes geometry and
 - Source: `brew install boost lua shapelib rapidjson && git clone https://github.com/systemed/tilemaker && cd tilemaker && make && sudo make install` (or skip `make install` and pass `TILEMAKER=./tilemaker/tilemaker` to the script). Needs a recent build — the profile's `high_resolution` config key predates any tagged release, so build from `master`.
 - Docker: `docker run --rm -v /tmp:/tmp -v "$PWD:$PWD" -w "$PWD" ghcr.io/systemed/tilemaker:master …`. The CI workflow installs a one-line wrapper of exactly this at `/usr/local/bin/tilemaker` so the script calls `tilemaker` unchanged; do the same locally to drive the script via Docker.
 
-Then `brew install osmium-tool` and run `ONLY_REGION=<id> SKIP_UPLOAD=1 ./deploy-routing-tiles.sh` — builds the `.pmtiles` into `./routing-tiles-out/` with no S3 or AWS creds. Continental regions are large downloads; for a quick check, point a scratch `REGIONS_FILE`/`SOURCES_FILE` at a small city bbox + a Geofabrik city/state extract.
+Then `brew install osmium-tool` and run `ONLY_REGION=<id> SKIP_UPLOAD=1 ./tiles/build-routing.sh` — builds the `.pmtiles` into `./routing-tiles-out/` with no S3 or AWS creds. Continental regions are large downloads; for a quick check, point a scratch `REGIONS_FILE`/`SOURCES_FILE` at a small city bbox + a Geofabrik city/state extract.

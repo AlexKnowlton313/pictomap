@@ -11,8 +11,20 @@
 export interface ManifestRegion {
   id: string;
   name: string;
-  /** [minLng, minLat, maxLng, maxLat] */
+  /**
+   * Ownership bbox [minLng, minLat, maxLng, maxLat] — the partition used for
+   * region selection (selectRegion picks the first region whose bbox contains
+   * the user).
+   */
   bbox: [number, number, number, number];
+  /**
+   * Extent bbox — ownership bbox plus the build's overlap margin, i.e. the
+   * geography the archive actually covers. Emitted by the build scripts for
+   * every region. Currently unused by the client (selection + maxBounds still
+   * use `bbox`); it exists so chunked regions are ready for multi-archive
+   * reads. See docs/regional-chunking.md.
+   */
+  extentBbox?: [number, number, number, number];
   filename: string;
   sizeBytes: number;
 }
@@ -30,7 +42,7 @@ export const DEFAULT_MANIFEST_URL = '/tiles/manifest.json';
 /**
  * Routing tileset manifest — same shape as the display manifest, listing the
  * custom roads+paths PMTiles (tiles/routing/, published by
- * deploy-routing-tiles.sh) that the graph worker builds the road graph from.
+ * tiles/build-routing.sh) that the graph worker builds the road graph from.
  * Published independently of the display manifest at its own stable URL.
  */
 export const DEFAULT_ROUTING_MANIFEST_URL = '/tiles/routing-manifest.json';

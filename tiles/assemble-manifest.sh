@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 # Merge per-region manifest fragments into manifest.json and upload it.
 #
-# deploy-tiles.sh writes one fragment per region (region config + published
-# filename + on-disk size) into FRAGMENT_DIR. This script orders them by their
-# position in REGIONS_FILE — the app selects the first region whose bbox
-# contains the user, so manifest order is significant — and publishes the
+# The build scripts write one fragment per region (region config + extentBbox +
+# published filename + on-disk size) into FRAGMENT_DIR. This script orders them
+# by their position in REGIONS_FILE — the app selects the first region whose
+# bbox contains the user, so manifest order is significant — and publishes the
 # manifest at a stable URL with a short cache so tile refreshes propagate
 # without an app redeploy.
 #
 # Used two ways:
-#   - a full deploy-tiles.sh run calls this at the end (all fragments present)
+#   - a full build-display.sh / build-routing.sh run calls this at the end
 #   - the CI assemble job runs it after gathering matrix shards' fragments
 #
 # Required env: FRAGMENT_DIR, SOURCE_DATE. Optional: MIN_ZOOM, MAX_ZOOM,
-# S3_PREFIX, REGIONS_FILE (must match the values used to build the fragments).
+# S3_PREFIX, REGIONS_FILE, MANIFEST_NAME (must match the fragment build values).
 
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tiles/lib.sh
+. "$SCRIPT_DIR/lib.sh"
+cd "$SCRIPT_DIR/.."
 
 MIN_ZOOM="${MIN_ZOOM:-12}"
 MAX_ZOOM="${MAX_ZOOM:-14}"
@@ -25,16 +28,10 @@ REGIONS_FILE="${REGIONS_FILE:-tiles/regions.json}"
 FRAGMENT_DIR="${FRAGMENT_DIR:?FRAGMENT_DIR is required}"
 SOURCE_DATE="${SOURCE_DATE:?SOURCE_DATE is required}"
 # Published manifest filename. The display pipeline writes manifest.json; the
-# routing pipeline reuses this same script with MANIFEST_NAME=routing-manifest.json.
+# routing pipeline reuses this script with MANIFEST_NAME=routing-manifest.json.
 MANIFEST_NAME="${MANIFEST_NAME:-manifest.json}"
 
-for cmd in aws jq; do
-  if ! command -v "$cmd" >/dev/null; then
-    echo "missing dependency: $cmd" >&2
-    exit 1
-  fi
-done
-
+require_cmds aws jq
 if [ ! -f "$REGIONS_FILE" ]; then
   echo "regions file not found: $REGIONS_FILE" >&2
   exit 1
@@ -42,6 +39,7 @@ fi
 
 # Collect fragments in REGIONS_FILE order; fail loudly if any region's shard
 # didn't produce one (an incomplete manifest would break region selection).
+# Whatever fields a fragment carries (incl. extentBbox) flow through unchanged.
 FRAGMENTS=()
 while IFS= read -r id; do
   frag="${FRAGMENT_DIR}/${id}.json"

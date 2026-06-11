@@ -260,9 +260,20 @@ export class Matcher {
         prevCand: -1,
       }));
 
+      // The only distances routeDistance reads are to the endpoint nodes of
+      // this frame's candidate edges — let Dijkstra stop once those settle
+      // instead of flooding the whole cap radius.
+      const targets: number[] = [];
+      for (const c of cur) {
+        const a = this.edgeA[c.edgeId];
+        const b = this.edgeB[c.edgeId];
+        if (!targets.includes(a)) targets.push(a);
+        if (!targets.includes(b)) targets.push(b);
+      }
+
       for (let j = 0; j < prev.length; j++) {
         if (!Number.isFinite(dp[j])) continue;
-        const distMap = this.boundedDijkstra(prev[j], cap);
+        const distMap = this.boundedDijkstra(prev[j], cap, targets);
         dijkstraCalls++;
         dijkstraNodesSum += distMap.size;
         for (let k = 0; k < cur.length; k++) {
@@ -349,12 +360,19 @@ export class Matcher {
   /**
    * Bounded Dijkstra from `src`'s two endpoint nodes, with initial costs
    * equal to the meters from src's projection to each endpoint. Returns
-   * a node→cost map limited to costs ≤ maxCost.
+   * a node→cost map limited to costs ≤ maxCost. Terminates early once
+   * every node in `targets` is settled — settled distances are final, so
+   * the callers' reads are unaffected by the truncated frontier.
    */
-  private boundedDijkstra(src: Candidate, maxCost: number): Map<number, number> {
+  private boundedDijkstra(
+    src: Candidate,
+    maxCost: number,
+    targets: number[],
+  ): Map<number, number> {
     const dist = new Map<number, number>();
     const heap = new MinHeap<number>();
     const len = this.edgeLen[src.edgeId];
+    const unsettled = new Set(targets);
 
     const seed = (nodeId: number, cost: number) => {
       if (cost > maxCost) return;
@@ -371,6 +389,7 @@ export class Matcher {
       const u = top.v;
       const du = top.p;
       if (du > (dist.get(u) ?? Infinity)) continue;
+      if (unsettled.delete(u) && unsettled.size === 0) break;
       for (const eId of this.adj[u]) {
         const v = this.edgeA[eId] === u ? this.edgeB[eId] : this.edgeA[eId];
         const nd = du + this.edgeLen[eId];

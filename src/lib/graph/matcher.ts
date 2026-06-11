@@ -10,7 +10,6 @@
  */
 
 import { MinHeap } from './heap';
-import { buildEdgeAdjacency } from './graph-utils';
 import { frame, fromLocal, toLocal, type LocalFrame } from './projection';
 import {
   angleDiff,
@@ -94,8 +93,23 @@ export class Matcher {
   private edgeB: Int32Array;
   private edgeLen: Float32Array;
   private edgeKlass: RoadClass[];
-  /** Adjacency: nodeId → array of edge IDs incident on it. */
-  private adj: number[][];
+  /**
+   * Adjacency in CSR layout: edge ids incident on node n are
+   * adjEdge[adjOff[n] .. adjOff[n+1]). Flat typed arrays keep the Dijkstra
+   * inner loop free of per-node array allocations and pointer chasing.
+   */
+  private adjOff: Int32Array;
+  private adjEdge: Int32Array;
+  /**
+   * Epoch-stamped Dijkstra scratch, allocated once per graph. A slot is
+   * valid only when its distEpoch equals the current epoch, so "clearing"
+   * between runs is a counter bump instead of a reallocation — Map
+   * get/set was the dominant constant factor in the hot loops.
+   */
+  private dist: Float64Array;
+  private distEpoch: Int32Array;
+  private predFrom: Int32Array;
+  private epoch = 0;
 
   constructor(graph: RoadGraph) {
     const cx = (graph.bbox.west + graph.bbox.east) / 2;
@@ -131,7 +145,25 @@ export class Matcher {
       this.edgeKlass[i] = e.klass;
     }
 
-    this.adj = buildEdgeAdjacency(graph.nodes.length, graph.edges);
+    // CSR adjacency: count degrees, prefix-sum into offsets, then fill
+    // with a per-node cursor.
+    const nodeCount = graph.nodes.length;
+    this.adjOff = new Int32Array(nodeCount + 1);
+    for (let i = 0; i < n; i++) {
+      this.adjOff[this.edgeA[i] + 1]++;
+      this.adjOff[this.edgeB[i] + 1]++;
+    }
+    for (let v = 0; v < nodeCount; v++) this.adjOff[v + 1] += this.adjOff[v];
+    this.adjEdge = new Int32Array(n * 2);
+    const cursor = this.adjOff.slice(0, nodeCount);
+    for (let i = 0; i < n; i++) {
+      this.adjEdge[cursor[this.edgeA[i]]++] = i;
+      this.adjEdge[cursor[this.edgeB[i]]++] = i;
+    }
+
+    this.dist = new Float64Array(nodeCount);
+    this.distEpoch = new Int32Array(nodeCount);
+    this.predFrom = new Int32Array(nodeCount);
   }
 
   match(contourLngLat: [number, number][]): MatchResult {
@@ -273,12 +305,12 @@ export class Matcher {
 
       for (let j = 0; j < prev.length; j++) {
         if (!Number.isFinite(dp[j])) continue;
-        const distMap = this.boundedDijkstra(prev[j], cap, targets);
+        const reached = this.boundedDijkstra(prev[j], cap, targets);
         dijkstraCalls++;
-        dijkstraNodesSum += distMap.size;
+        dijkstraNodesSum += reached;
         for (let k = 0; k < cur.length; k++) {
           totalTransitions++;
-          const routeDist = this.routeDistance(prev[j], cur[k], distMap);
+          const routeDist = this.routeDistance(prev[j], cur[k]);
           if (!Number.isFinite(routeDist) || routeDist > cap) continue;
           okTransitions++;
           const routeTerm = ROUTE_DEVIATION_PER_M * Math.abs(routeDist - stepLen);
@@ -336,15 +368,17 @@ export class Matcher {
 
   // ── routing ────────────────────────────────────────────────────────────
 
+  /** Distance for node `nodeId` from the most recent Dijkstra run. */
+  private nodeDist(nodeId: number): number {
+    return this.distEpoch[nodeId] === this.epoch ? this.dist[nodeId] : Infinity;
+  }
+
   /**
-   * Network distance from candidate `src` to candidate `dst`, given a
-   * pre-computed Dijkstra distance map from src's endpoints.
+   * Network distance from candidate `src` to candidate `dst`, reading the
+   * distances left in scratch by the preceding boundedDijkstra run from
+   * src's endpoints.
    */
-  private routeDistance(
-    src: Candidate,
-    dst: Candidate,
-    srcDist: Map<number, number>,
-  ): number {
+  private routeDistance(src: Candidate, dst: Candidate): number {
     // Special case: same edge — distance along the edge between offsets.
     if (src.edgeId === dst.edgeId) {
       return Math.abs(dst.proj.offset - src.proj.offset);
@@ -352,33 +386,34 @@ export class Matcher {
     const dstLen = this.edgeLen[dst.edgeId];
     const offFromA = dst.proj.offset;
     const offFromB = dstLen - dst.proj.offset;
-    const viaA = (srcDist.get(this.edgeA[dst.edgeId]) ?? Infinity) + offFromA;
-    const viaB = (srcDist.get(this.edgeB[dst.edgeId]) ?? Infinity) + offFromB;
+    const viaA = this.nodeDist(this.edgeA[dst.edgeId]) + offFromA;
+    const viaB = this.nodeDist(this.edgeB[dst.edgeId]) + offFromB;
     return Math.min(viaA, viaB);
   }
 
   /**
    * Bounded Dijkstra from `src`'s two endpoint nodes, with initial costs
-   * equal to the meters from src's projection to each endpoint. Returns
-   * a node→cost map limited to costs ≤ maxCost. Terminates early once
-   * every node in `targets` is settled — settled distances are final, so
-   * the callers' reads are unaffected by the truncated frontier.
+   * equal to the meters from src's projection to each endpoint. Distances
+   * are written into the epoch-stamped scratch (read back via nodeDist),
+   * limited to costs ≤ maxCost. Terminates early once every node in
+   * `targets` is settled — settled distances are final, so the callers'
+   * reads are unaffected by the truncated frontier. Returns the number of
+   * nodes reached, for the HUD stats.
    */
-  private boundedDijkstra(
-    src: Candidate,
-    maxCost: number,
-    targets: number[],
-  ): Map<number, number> {
-    const dist = new Map<number, number>();
+  private boundedDijkstra(src: Candidate, maxCost: number, targets: number[]): number {
+    const epoch = ++this.epoch;
+    const { dist, distEpoch } = this;
     const heap = new MinHeap<number>();
     const len = this.edgeLen[src.edgeId];
     const unsettled = new Set(targets);
+    let reached = 0;
 
     const seed = (nodeId: number, cost: number) => {
       if (cost > maxCost) return;
-      const existing = dist.get(nodeId);
-      if (existing !== undefined && existing <= cost) return;
-      dist.set(nodeId, cost);
+      if (distEpoch[nodeId] === epoch && dist[nodeId] <= cost) return;
+      if (distEpoch[nodeId] !== epoch) reached++;
+      distEpoch[nodeId] = epoch;
+      dist[nodeId] = cost;
       heap.push(cost, nodeId);
     };
     seed(this.edgeA[src.edgeId], src.proj.offset);
@@ -388,19 +423,24 @@ export class Matcher {
       const top = heap.pop()!;
       const u = top.v;
       const du = top.p;
-      if (du > (dist.get(u) ?? Infinity)) continue;
+      if (du > dist[u]) continue; // stale heap entry
       if (unsettled.delete(u) && unsettled.size === 0) break;
-      for (const eId of this.adj[u]) {
+      for (let ai = this.adjOff[u]; ai < this.adjOff[u + 1]; ai++) {
+        const eId = this.adjEdge[ai];
         const v = this.edgeA[eId] === u ? this.edgeB[eId] : this.edgeA[eId];
         const nd = du + this.edgeLen[eId];
         if (nd > maxCost) continue;
-        if (nd < (dist.get(v) ?? Infinity)) {
-          dist.set(v, nd);
-          heap.push(nd, v);
+        if (distEpoch[v] !== epoch) {
+          reached++;
+          distEpoch[v] = epoch;
+        } else if (nd >= dist[v]) {
+          continue;
         }
+        dist[v] = nd;
+        heap.push(nd, v);
       }
     }
-    return dist;
+    return reached;
   }
 
   // ── route reconstruction ───────────────────────────────────────────────
@@ -438,16 +478,16 @@ export class Matcher {
     // the reconstruction search can be bounded by the same ceiling instead
     // of exploring the whole component.
     const dstNodes = [this.edgeA[dst.edgeId], this.edgeB[dst.edgeId]];
-    const pred = this.dijkstraWithPred(src, dstNodes, TRANSITION_CAP_M);
+    this.dijkstraWithPred(src, dstNodes, TRANSITION_CAP_M);
     let bestEnd = -1;
     let bestTotal = Infinity;
     for (const n of dstNodes) {
-      const r = pred.get(n);
-      if (!r) continue;
+      const cost = this.nodeDist(n);
+      if (!Number.isFinite(cost)) continue;
       const offsetOnDst = n === this.edgeA[dst.edgeId]
         ? dst.proj.offset
         : this.edgeLen[dst.edgeId] - dst.proj.offset;
-      const total = r.cost + offsetOnDst;
+      const total = cost + offsetOnDst;
       if (total < bestTotal) {
         bestTotal = total;
         bestEnd = n;
@@ -459,13 +499,12 @@ export class Matcher {
       return [src.proj.point, dst.proj.point];
     }
 
-    // Walk predecessors back to src.
+    // Walk predecessors back to src (seeds carry predFrom = -1).
     const nodeChain: number[] = [];
-    let cur: number | null = bestEnd;
-    while (cur !== null && cur !== -1) {
+    let cur = bestEnd;
+    while (cur !== -1) {
       nodeChain.push(cur);
-      const entry: { from: number | null; cost: number } | undefined = pred.get(cur);
-      cur = entry ? entry.from : null;
+      cur = this.predFrom[cur];
     }
     nodeChain.reverse();
     // First entry in nodeChain is one of src's endpoint nodes.
@@ -503,26 +542,25 @@ export class Matcher {
   }
 
   /**
-   * Dijkstra from src candidate's endpoints with predecessor + cost
-   * tracking. Bounded by `maxCost`, and terminates as soon as every node
-   * in `targets` is settled — the caller only ever reads the targets'
+   * Dijkstra from src candidate's endpoints with predecessor tracking
+   * (into the epoch-stamped scratch; read back via nodeDist/predFrom).
+   * Bounded by `maxCost`, and terminates as soon as every node in
+   * `targets` is settled — the caller only ever reads the targets'
    * chains, so the rest of the frontier is wasted work.
    */
-  private dijkstraWithPred(
-    src: Candidate,
-    targets: number[],
-    maxCost: number,
-  ): Map<number, { from: number | null; cost: number }> {
-    const result = new Map<number, { from: number | null; cost: number }>();
+  private dijkstraWithPred(src: Candidate, targets: number[], maxCost: number): void {
+    const epoch = ++this.epoch;
+    const { dist, distEpoch, predFrom } = this;
     const heap = new MinHeap<number>();
     const len = this.edgeLen[src.edgeId];
     const unsettled = new Set(targets);
 
     const seed = (nodeId: number, cost: number) => {
       if (cost > maxCost) return;
-      const ex = result.get(nodeId);
-      if (ex && ex.cost <= cost) return;
-      result.set(nodeId, { from: null, cost });
+      if (distEpoch[nodeId] === epoch && dist[nodeId] <= cost) return;
+      distEpoch[nodeId] = epoch;
+      dist[nodeId] = cost;
+      predFrom[nodeId] = -1;
       heap.push(cost, nodeId);
     };
     seed(this.edgeA[src.edgeId], src.proj.offset);
@@ -532,26 +570,27 @@ export class Matcher {
       const top = heap.pop()!;
       const u = top.v;
       const du = top.p;
-      const cur = result.get(u);
-      if (!cur || du > cur.cost) continue;
+      if (du > dist[u]) continue; // stale heap entry
       if (unsettled.delete(u) && unsettled.size === 0) break;
-      for (const eId of this.adj[u]) {
+      for (let ai = this.adjOff[u]; ai < this.adjOff[u + 1]; ai++) {
+        const eId = this.adjEdge[ai];
         const v = this.edgeA[eId] === u ? this.edgeB[eId] : this.edgeA[eId];
         const nd = du + this.edgeLen[eId];
         if (nd > maxCost) continue;
-        const ex = result.get(v);
-        if (!ex || nd < ex.cost) {
-          result.set(v, { from: u, cost: nd });
+        if (distEpoch[v] !== epoch || nd < dist[v]) {
+          distEpoch[v] = epoch;
+          dist[v] = nd;
+          predFrom[v] = u;
           heap.push(nd, v);
         }
       }
     }
-    return result;
   }
 
   /** Linear scan over node `u`'s adjacency list for an edge to `v`. */
   private findEdgeBetween(u: number, v: number): number {
-    for (const eId of this.adj[u]) {
+    for (let ai = this.adjOff[u]; ai < this.adjOff[u + 1]; ai++) {
+      const eId = this.adjEdge[ai];
       if (this.edgeA[eId] === v || this.edgeB[eId] === v) return eId;
     }
     return -1;

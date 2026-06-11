@@ -39,7 +39,7 @@
   async function snapToRoads(): Promise<void> {
     const svc = graphStore.service;
     if (!svc || !state.image || !state.contour || !state.overlay) return;
-    if (!graphStore.graph) {
+    if (!graphStore.summary) {
       // Graph hasn't loaded yet — retry shortly.
       scheduleSnap(SNAP_DEBOUNCE_MS);
       return;
@@ -134,7 +134,7 @@
       <div class="actions">
         <button
           onclick={() => scheduleSnap(0)}
-          disabled={state.matching || !graphStore.graph}
+          disabled={state.matching || !graphStore.summary}
           title="Force re-snap now"
         >
           {state.matching ? 'Snapping…' : '↻ Re-snap'}

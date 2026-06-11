@@ -1,7 +1,8 @@
 import type {
   BBox,
+  DebugRoute,
+  GraphSummary,
   MatchResultMsg,
-  RoadGraph,
   WorkerRequest,
   WorkerResponse,
 } from './types';
@@ -40,12 +41,12 @@ export class GraphService {
     });
   }
 
-  async buildGraph(bbox: BBox): Promise<RoadGraph> {
+  async buildGraph(bbox: BBox): Promise<GraphSummary> {
     await this.readyP;
     return new Promise((resolve, reject) => {
       const reqId = this.nextReqId++;
       this.pending.set(reqId, {
-        resolve: (v) => resolve(v as RoadGraph),
+        resolve: (v) => resolve(v as GraphSummary),
         reject,
       });
       this.send({ type: 'buildGraph', reqId, bbox });
@@ -64,6 +65,32 @@ export class GraphService {
     });
   }
 
+  /** Debug overlay: fetch the worker-resident graph as GeoJSON on demand. */
+  async graphGeoJSON(): Promise<GeoJSON.FeatureCollection> {
+    await this.readyP;
+    return new Promise((resolve, reject) => {
+      const reqId = this.nextReqId++;
+      this.pending.set(reqId, {
+        resolve: (v) => resolve(v as GeoJSON.FeatureCollection),
+        reject,
+      });
+      this.send({ type: 'graphGeoJSON', reqId });
+    });
+  }
+
+  /** Debug probe: shortest node-network path between two clicks. */
+  async debugRoute(a: [number, number], b: [number, number]): Promise<DebugRoute | null> {
+    await this.readyP;
+    return new Promise((resolve, reject) => {
+      const reqId = this.nextReqId++;
+      this.pending.set(reqId, {
+        resolve: (v) => resolve(v as DebugRoute | null),
+        reject,
+      });
+      this.send({ type: 'debugRoute', reqId, a, b });
+    });
+  }
+
   destroy(): void {
     this.worker.terminate();
     this.pending.clear();
@@ -78,8 +105,10 @@ export class GraphService {
     if (!p) return;
     this.pending.delete(res.reqId);
     if (res.type === 'ready') p.resolve(undefined);
-    else if (res.type === 'graph') p.resolve(res.graph);
+    else if (res.type === 'graph') p.resolve(res.summary);
     else if (res.type === 'match') p.resolve(res.result);
+    else if (res.type === 'graphGeoJSON') p.resolve(res.geojson);
+    else if (res.type === 'debugRoute') p.resolve(res.route);
     else p.reject(new Error(res.message));
   }
 }

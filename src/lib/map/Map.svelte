@@ -23,8 +23,7 @@
     tilesCoveringBBox,
     GRAPH_ZOOM,
   } from '../graph/tile-math';
-  import type { BBox, RoadGraph } from '../graph/types';
-  import { routeBetweenPoints } from '../graph/debug-route';
+  import type { BBox } from '../graph/types';
   import { state as appState } from '../state.svelte';
   import {
     DEFAULT_MANIFEST_URL,
@@ -162,19 +161,17 @@
     }
   }
 
-  function graphToGeoJSON(g: RoadGraph): GeoJSON.FeatureCollection {
-    return {
-      type: 'FeatureCollection',
-      features: g.edges.map((e) => ({
-        type: 'Feature',
-        properties: { klass: e.klass, length: e.length },
-        geometry: { type: 'LineString', coordinates: e.coords },
-      })),
-    };
-  }
+  // Debug layers are built lazily: a rebuild only marks them stale, and the
+  // data (a ~20k-feature FeatureCollection for the graph) is fetched from
+  // the worker / regenerated only while the layer is actually shown.
+  let graphLayerStale = true;
+  let tilesLayerStale = true;
 
-  function renderGraph(g: RoadGraph): void {
-    upsertGeoJSON(GRAPH_SOURCE_ID, GRAPH_LAYER_ID, graphToGeoJSON(g), {
+  async function refreshGraphLayer(): Promise<void> {
+    const svc = graphStore.service;
+    if (!svc || !graphStore.summary) return;
+    const geojson = await svc.graphGeoJSON();
+    upsertGeoJSON(GRAPH_SOURCE_ID, GRAPH_LAYER_ID, geojson, {
       type: 'line',
       layout: {
         'line-cap': 'round',
@@ -197,10 +194,12 @@
         'line-opacity': 0.85,
       },
     });
+    graphLayerStale = false;
   }
 
-  function toggleGraph(): void {
+  async function toggleGraph(): Promise<void> {
     showGraph = !showGraph;
+    if (showGraph && graphLayerStale) await refreshGraphLayer();
     if (!map || !map.getLayer(GRAPH_LAYER_ID)) return;
     map.setLayoutProperty(
       GRAPH_LAYER_ID,
@@ -240,8 +239,9 @@
     return { type: 'FeatureCollection', features };
   }
 
-  function renderTiles(bbox: BBox): void {
-    upsertGeoJSON(TILE_SOURCE_ID, TILE_LAYER_ID, tileGridGeoJSON(bbox), {
+  function refreshTilesLayer(): void {
+    if (!graphStore.summary) return;
+    upsertGeoJSON(TILE_SOURCE_ID, TILE_LAYER_ID, tileGridGeoJSON(graphStore.summary.bbox), {
       type: 'line',
       layout: { visibility: showTiles ? 'visible' : 'none' },
       paint: {
@@ -251,10 +251,12 @@
         'line-dasharray': [4, 3],
       },
     });
+    tilesLayerStale = false;
   }
 
   function toggleTiles(): void {
     showTiles = !showTiles;
+    if (showTiles && tilesLayerStale) refreshTilesLayer();
     if (!map || !map.getLayer(TILE_LAYER_ID)) return;
     map.setLayoutProperty(TILE_LAYER_ID, 'visibility', showTiles ? 'visible' : 'none');
   }
@@ -304,7 +306,7 @@
     renderDebugPoints([]);
   }
 
-  function onDebugClick(lngLat: maplibregl.LngLat): void {
+  async function onDebugClick(lngLat: maplibregl.LngLat): Promise<void> {
     const click: [number, number] = [lngLat.lng, lngLat.lat];
     // A click after a completed pair starts a fresh probe.
     routePts = routePts.length >= 2 ? [click] : [...routePts, click];
@@ -315,20 +317,25 @@
       renderDebugRoute(null);
       return;
     }
-    const g = graphStore.graph;
-    if (!g) {
+    const svc = graphStore.service;
+    if (!svc || !graphStore.summary) {
       routeInfo = 'No graph built yet';
       return;
     }
-    const r = routeBetweenPoints(g, routePts[0], routePts[1]);
-    if (!r) {
-      routeInfo = 'No path — points are in different components';
-      renderDebugRoute(null);
-      return;
+    routeInfo = 'Routing…';
+    try {
+      const r = await svc.debugRoute(routePts[0], routePts[1]);
+      if (!r) {
+        routeInfo = 'No path — points are in different components';
+        renderDebugRoute(null);
+        return;
+      }
+      renderDebugRoute(r.coords);
+      routeInfo =
+        `${Math.round(r.lengthM)} m · snap ${Math.round(r.startSnapM)}/${Math.round(r.endSnapM)} m`;
+    } catch (err) {
+      routeInfo = errorMessage(err);
     }
-    renderDebugRoute(r.coords);
-    routeInfo =
-      `${Math.round(r.lengthM)} m · snap ${Math.round(r.startSnapM)}/${Math.round(r.endSnapM)} m`;
   }
 
   function toggleRouteMode(): void {
@@ -376,7 +383,7 @@
     if (!vp) return;
     const needed = expandBBox(vp, GRAPH_BUFFER_M);
 
-    if (graphStore.graph && bboxContains(graphStore.graph.bbox, needed)) {
+    if (graphStore.summary && bboxContains(graphStore.summary.bbox, needed)) {
       return; // existing graph already covers viewport + buffer
     }
 
@@ -389,10 +396,12 @@
     graphStore.building = true;
     graphStore.error = null;
     try {
-      const graph = await svc.buildGraph(needed);
-      graphStore.graph = graph;
-      renderGraph(graph);
-      renderTiles(graph.bbox);
+      graphStore.summary = await svc.buildGraph(needed);
+      // New graph — debug layers are stale; refresh only the visible ones.
+      graphLayerStale = true;
+      tilesLayerStale = true;
+      if (showGraph) void refreshGraphLayer();
+      if (showTiles) refreshTilesLayer();
     } catch (err) {
       graphStore.error = errorMessage(err);
     } finally {
@@ -494,7 +503,7 @@
 
     // Debug route probe: in route mode, clicks drop start/end points.
     map.on('click', (e) => {
-      if (routeMode) onDebugClick(e.lngLat);
+      if (routeMode) void onDebugClick(e.lngLat);
     });
 
     graphStore.service = new GraphService(graphUrl, graphZoom);
@@ -563,7 +572,7 @@
     map = null;
     graphStore.service?.destroy();
     graphStore.service = null;
-    graphStore.graph = null;
+    graphStore.summary = null;
   });
 </script>
 
@@ -597,21 +606,21 @@
   </button>
   <button
     onclick={toggleGraph}
-    disabled={!graphStore.graph}
+    disabled={!graphStore.summary}
     title="Toggle the extracted road graph overlay"
   >
     {showGraph ? 'Hide' : 'Show'} graph
   </button>
   <button
     onclick={toggleTiles}
-    disabled={!graphStore.graph}
+    disabled={!graphStore.summary}
     title="Toggle z13 tile boundaries — check whether road gaps fall on tile seams"
   >
     {showTiles ? 'Hide' : 'Show'} tiles
   </button>
   <button
     onclick={toggleRouteMode}
-    disabled={!graphStore.graph}
+    disabled={!graphStore.summary}
     class:active={routeMode}
     title="Route probe: click two points to route between them over the node network"
   >
@@ -629,10 +638,10 @@
   {/if}
   {#if graphStore.building}
     <span class="muted">Building graph…</span>
-  {:else if graphStore.graph}
+  {:else if graphStore.summary}
     <span class="muted" title="Edges · nodes · tiles · build ms">
-      {graphStore.graph.edges.length}e · {graphStore.graph.nodes.length}n ·
-      {graphStore.graph.tileCount}t · {graphStore.graph.buildMs}ms
+      {graphStore.summary.edgeCount}e · {graphStore.summary.nodeCount}n ·
+      {graphStore.summary.tileCount}t · {graphStore.summary.buildMs}ms
     </span>
   {/if}
   {#if routeMode && routeInfo}

@@ -1,7 +1,7 @@
 /**
- * Debug-only point-to-point routing over the built RoadGraph, run on the
- * main thread (the graph already lives in `graphStore.graph`, so there's
- * no reason to round-trip the worker for an interactive probe).
+ * Debug-only point-to-point routing over the built RoadGraph. Runs in the
+ * graph worker (the full graph lives there; the main thread only holds a
+ * summary) via the `debugRoute` request.
  *
  * Unlike the matcher — which routes between *edge projections* of a whole
  * contour — this snaps each click to the nearest graph node and runs a

@@ -1,20 +1,19 @@
 import type { GraphService } from './service';
-import type { RoadGraph } from './types';
+import type { GraphSummary } from './types';
 
 /**
- * Singleton holding the graph worker + the most-recent built graph.
+ * Singleton holding the graph worker + the most-recent build's summary.
  *
- * The service is shared across consumers: debug overlay reads `graph` to
- * draw road lines; the matcher (Task 6c) will reach in for the same graph
- * to query candidates and shortest paths.
+ * The full RoadGraph stays in the worker (matching, debug GeoJSON and the
+ * route probe all run there); the main thread only keeps the summary —
+ * bbox for rebuild checks, counts/timings for the HUD.
  *
  * `.raw` on `service` because Worker is opaque to reactivity; `.raw` on
- * `graph` because it's a large flat blob and we don't want fine-grained
- * proxying — consumers re-render on identity change only.
+ * `summary` because consumers re-render on identity change only.
  */
 class GraphStore {
   service = $state.raw<GraphService | null>(null);
-  graph = $state.raw<RoadGraph | null>(null);
+  summary = $state.raw<GraphSummary | null>(null);
   /** True while a build is in flight. */
   building = $state(false);
   /** Last build error message; null when the latest build succeeded. */

@@ -5,6 +5,7 @@ import { VectorTile } from '@mapbox/vector-tile';
 import Pbf from 'pbf';
 import { classifyRoad, isRunnable } from './highway';
 import { buildEdgeAdjacency } from './graph-utils';
+import { routeBetweenPoints } from './debug-route';
 import { Matcher } from './matcher';
 import { TileCache } from './tile-cache';
 import { METERS_PER_DEG_LAT } from '../geo';
@@ -33,12 +34,17 @@ import type {
  *   1. `init` — receive PMTiles URL, instantiate PMTiles client.
  *   2. `buildGraph` — fetch all routing-tileset tiles (GRAPH_ZOOM) covering
  *      bbox, decode MVT, classify the `roads` layer, stitch endpoints into
- *      nodes, reply with a flat RoadGraph.
+ *      nodes. The full RoadGraph stays here; only a GraphSummary goes back
+ *      (cloning ~20k densified edges per pan-rebuild is wasted work — the
+ *      main thread reads bbox + counts, and the debug overlays pull
+ *      `graphGeoJSON` / `debugRoute` on demand).
  */
 
 let pmtiles: PMTiles | null = null;
 let tileCache: TileCache | null = null;
 let matcher: Matcher | null = null;
+/** Most recently built graph; serves match, graphGeoJSON and debugRoute. */
+let currentGraph: RoadGraph | null = null;
 /** Max zoom of the active tileset; set at init. See GRAPH_ZOOM for the default. */
 let graphZoom = GRAPH_ZOOM;
 
@@ -63,8 +69,19 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       const graph = await buildGraph(pmtiles, req.bbox, graphZoom);
       // Keep the latest graph live so the matcher can query it without
       // re-shipping ~20k edges from the main thread on every snap.
+      currentGraph = graph;
       matcher = new Matcher(graph);
-      reply({ type: 'graph', reqId: req.reqId, graph });
+      reply({
+        type: 'graph',
+        reqId: req.reqId,
+        summary: {
+          bbox: graph.bbox,
+          nodeCount: graph.nodes.length,
+          edgeCount: graph.edges.length,
+          buildMs: graph.buildMs,
+          tileCount: graph.tileCount,
+        },
+      });
       return;
     }
 
@@ -72,6 +89,22 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       if (!matcher) throw new Error('No graph built yet — call `buildGraph` first');
       const result = matcher.match(req.contour);
       reply({ type: 'match', reqId: req.reqId, result });
+      return;
+    }
+
+    if (req.type === 'graphGeoJSON') {
+      if (!currentGraph) throw new Error('No graph built yet — call `buildGraph` first');
+      reply({ type: 'graphGeoJSON', reqId: req.reqId, geojson: graphToGeoJSON(currentGraph) });
+      return;
+    }
+
+    if (req.type === 'debugRoute') {
+      if (!currentGraph) throw new Error('No graph built yet — call `buildGraph` first');
+      reply({
+        type: 'debugRoute',
+        reqId: req.reqId,
+        route: routeBetweenPoints(currentGraph, req.a, req.b),
+      });
       return;
     }
   } catch (err) {
@@ -85,6 +118,18 @@ ctx.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
 function reply(res: WorkerResponse): void {
   ctx.postMessage(res);
+}
+
+/** Debug-overlay payload: one LineString feature per edge. */
+function graphToGeoJSON(g: RoadGraph): GeoJSON.FeatureCollection {
+  return {
+    type: 'FeatureCollection',
+    features: g.edges.map((e) => ({
+      type: 'Feature',
+      properties: { klass: e.klass, length: e.length },
+      geometry: { type: 'LineString', coordinates: e.coords },
+    })),
+  };
 }
 
 // --- Graph build ---------------------------------------------------------

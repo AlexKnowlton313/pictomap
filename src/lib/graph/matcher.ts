@@ -59,6 +59,18 @@ const RUNNABILITY_PENALTY: Record<RoadClass, number> = {
   other: 0.25,
 };
 
+// ── candidate spatial hash ───────────────────────────────────────────────
+
+/**
+ * Cell size for the edge-bbox spatial hash used by findCandidates. Coarse
+ * relative to CANDIDATE_RADIUS_M so a query touches at most ~2×2 cells,
+ * fine enough that a cell holds only nearby edges.
+ */
+const CAND_CELL_M = 128;
+const CAND_CELL_BIAS = 32768; // cells span ±4194 km in local meters — plenty
+const candCellKey = (cx: number, cy: number): number =>
+  (cx + CAND_CELL_BIAS) * 65536 + (cy + CAND_CELL_BIAS);
+
 // ── candidate types ──────────────────────────────────────────────────────
 
 interface Candidate {
@@ -110,6 +122,11 @@ export class Matcher {
   private distEpoch: Int32Array;
   private predFrom: Int32Array;
   private epoch = 0;
+  /** Spatial hash: cell key → edge ids whose bbox overlaps the cell. */
+  private cellEdges: Map<number, number[]>;
+  /** Epoch-stamped dedupe for edges spanning several queried cells. */
+  private edgeSeen: Int32Array;
+  private seenEpoch = 0;
 
   constructor(graph: RoadGraph) {
     const cx = (graph.bbox.west + graph.bbox.east) / 2;
@@ -164,6 +181,24 @@ export class Matcher {
     this.dist = new Float64Array(nodeCount);
     this.distEpoch = new Int32Array(nodeCount);
     this.predFrom = new Int32Array(nodeCount);
+
+    // Index every edge bbox into the candidate spatial hash.
+    this.cellEdges = new Map();
+    for (let i = 0; i < n; i++) {
+      const minCx = Math.floor(this.edgeBBox[i * 4] / CAND_CELL_M);
+      const minCy = Math.floor(this.edgeBBox[i * 4 + 1] / CAND_CELL_M);
+      const maxCx = Math.floor(this.edgeBBox[i * 4 + 2] / CAND_CELL_M);
+      const maxCy = Math.floor(this.edgeBBox[i * 4 + 3] / CAND_CELL_M);
+      for (let cx = minCx; cx <= maxCx; cx++) {
+        for (let cy = minCy; cy <= maxCy; cy++) {
+          const k = candCellKey(cx, cy);
+          const bucket = this.cellEdges.get(k);
+          if (bucket) bucket.push(i);
+          else this.cellEdges.set(k, [i]);
+        }
+      }
+    }
+    this.edgeSeen = new Int32Array(n);
   }
 
   match(contourLngLat: [number, number][]): MatchResult {
@@ -220,17 +255,29 @@ export class Matcher {
     const r2 = r * r;
     const minX = p[0] - r, minY = p[1] - r, maxX = p[0] + r, maxY = p[1] + r;
     const found: Candidate[] = [];
-    const n = this.edgePoly.length;
     const bb = this.edgeBBox;
-    for (let i = 0; i < n; i++) {
-      if (bb[i * 4] > maxX || bb[i * 4 + 2] < minX) continue;
-      if (bb[i * 4 + 1] > maxY || bb[i * 4 + 3] < minY) continue;
-      const proj = projectPointToPolyline(p, this.edgePoly[i]);
-      if (proj.d2 > r2) continue;
-      const d = Math.sqrt(proj.d2);
-      const emission = (d * d) / (2 * EMISSION_SIGMA_M * EMISSION_SIGMA_M)
-        + RUNNABILITY_PENALTY[this.edgeKlass[i]];
-      found.push({ edgeId: i, proj, emission });
+    const epoch = ++this.seenEpoch;
+    const minCx = Math.floor(minX / CAND_CELL_M);
+    const maxCx = Math.floor(maxX / CAND_CELL_M);
+    const minCy = Math.floor(minY / CAND_CELL_M);
+    const maxCy = Math.floor(maxY / CAND_CELL_M);
+    for (let cx = minCx; cx <= maxCx; cx++) {
+      for (let cy = minCy; cy <= maxCy; cy++) {
+        const bucket = this.cellEdges.get(candCellKey(cx, cy));
+        if (!bucket) continue;
+        for (const i of bucket) {
+          if (this.edgeSeen[i] === epoch) continue;
+          this.edgeSeen[i] = epoch;
+          if (bb[i * 4] > maxX || bb[i * 4 + 2] < minX) continue;
+          if (bb[i * 4 + 1] > maxY || bb[i * 4 + 3] < minY) continue;
+          const proj = projectPointToPolyline(p, this.edgePoly[i]);
+          if (proj.d2 > r2) continue;
+          const d = Math.sqrt(proj.d2);
+          const emission = (d * d) / (2 * EMISSION_SIGMA_M * EMISSION_SIGMA_M)
+            + RUNNABILITY_PENALTY[this.edgeKlass[i]];
+          found.push({ edgeId: i, proj, emission });
+        }
+      }
     }
     found.sort((a, b) => a.emission - b.emission);
     return found.slice(0, CANDIDATES_PER_POINT);

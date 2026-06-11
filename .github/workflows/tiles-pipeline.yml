@@ -259,14 +259,31 @@ jobs:
           tilemaker --version || true
           osmium --version
 
-      # Routing: pull every prepared roads pbf (all small) into roads/.
-      # build-routing.sh reads only the ones each region needs (ROADS_DIR).
+      # Routing: pull ONLY the prepared roads pbfs this region's sources need
+      # (ROADS_DIR for build-routing.sh). The prepared continents are GB-scale;
+      # pulling all of them into every shard would mean tens of GB of redundant
+      # artifact transfer + disk per run. A single source resolves to an exact
+      # artifact name; multi-source regions get a {a,b} brace glob (minimatch).
+      - name: Resolve this region's source artifacts
+        if: inputs.tools == 'osm'
+        id: roads
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          set -euo pipefail
+          pattern=$(jq -r --arg id "$REGION" '
+            [.[$id].sources[] | split("/") | last | sub("\\.osm\\.pbf$"; "") | "roads-" + .]
+            | if length == 1 then .[0] else "{" + join(",") + "}" end
+          ' tiles/osm-sources.json)
+          echo "pattern=$pattern" >> "$GITHUB_OUTPUT"
+          echo "artifact pattern: $pattern"
+
       - name: Download prepared sources
         if: inputs.tools == 'osm'
         uses: actions/download-artifact@v4
         with:
           path: roads
-          pattern: roads-*
+          pattern: ${{ steps.roads.outputs.pattern }}
           merge-multiple: true
 
       - uses: aws-actions/configure-aws-credentials@v4

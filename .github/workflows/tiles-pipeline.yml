@@ -302,8 +302,15 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Explicit if (not the default success() gate): build runs via always() to get
+  # past a skipped `prepare` (display has no sources), and that skip propagates
+  # transitively — a plain `needs` would skip assemble even when build fully
+  # succeeded, silently leaving the archives without a manifest. !cancelled() +
+  # the result checks run assemble whenever setup and build both succeeded, and
+  # still skip it (no partial manifest) if any build shard failed.
   assemble:
     needs: [setup, build]
+    if: ${{ !cancelled() && needs.setup.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -5,11 +5,10 @@
 # mechanics via tiles-pipeline.yml. The app fetches both manifests at startup;
 # the graph worker uses the routing one.
 #
-# These jobs are HEAVY: continent extracts are large (europe ~28GB) and
-# tilemaker reads every node, so the build runs with a generous timeout, frees
-# disk aggressively, and requests a long AWS session (continent builds outlive
-# the default 1h OIDC token). If weekly proves too costly, drop to monthly —
-# routing topology changes slowly.
+# These jobs are HEAVY: continent extracts are large (europe ~28GB; prepare
+# downloads + filters each one once and frees disk aggressively for it), so
+# the build runs with a generous timeout and requests a long AWS session
+# (continent builds outlive the default 1h OIDC token).
 
 name: Deploy routing tiles
 
@@ -54,7 +53,12 @@ jobs:
       # polite downloading at its own max-parallel: 4), so run all regions at
       # once instead of the display pipeline's throttled waves.
       build_max_parallel: 11
-      free_aggressive: true
+      # Build inputs are prefiltered + bbox-clipped roads pbfs, so the node
+      # store stays small and the base disk freeing suffices; the slow
+      # large-packages/swap pass (minutes per shard) was sized for raw
+      # continents. Flip back to true if a dense region runs out of disk.
+      # (The prepare job always frees aggressively — it holds raw continents.)
+      free_aggressive: false
       # Continent builds run past the default 1h OIDC session; request one that
       # outlives the 180m timeout (role MaxSessionDuration must allow it).
       role_duration: 14400

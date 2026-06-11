@@ -1,4 +1,4 @@
-# Weekly: generate the regional ROUTING PMTiles ourselves from raw OSM and
+# Monthly: generate the regional ROUTING PMTiles ourselves from raw OSM and
 # publish them + routing-manifest.json. Independent of the display pipeline —
 # different source (Geofabrik, not Protomaps), schema (roads + ped paths only,
 # one detail-preserving zoom) and manifest — but it reuses the same build
@@ -14,9 +14,11 @@ name: Deploy routing tiles
 
 on:
   schedule:
-    # Mondays 09:00 UTC — offset from the display run (07:00) so the two heavy
-    # tile jobs don't contend for the same hosted-runner pool.
-    - cron: '0 9 * * 1'
+    # 1st of the month, 09:00 UTC — routing topology changes slowly, and S3
+    # upload volume (not serving) is the tile-hosting cost driver, so monthly
+    # beats the old weekly cadence ~4x on cost. 09:00 keeps the offset from
+    # the display run (07:00) for months where the 1st is a Monday.
+    - cron: '0 9 1 * *'
   workflow_dispatch:
     inputs:
       zoom:

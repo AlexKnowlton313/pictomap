@@ -101,7 +101,7 @@ Three independent pipelines:
 
 - **App** (`./scripts/deploy-app.sh`, GitHub Actions `deploy.yml` on push to main): builds and syncs to `s3://alex-knowlton/pictomap/`, invalidates CloudFront. Doesn't bake in tile URLs — the app fetches the manifest at runtime.
 - **Display tiles** (`./tiles/build-display.sh`, GitHub Actions `deploy-tiles.yml` weekly): extracts regional PMTiles from Protomaps' daily planet build via `pmtiles extract --bbox=` per region, uploads each to `s3://alex-knowlton/pictomap/tiles/`, and writes a fresh `manifest.json` at a stable URL. These drive the **MapLibre basemap** only.
-- **Routing tiles** (`./tiles/build-routing.sh`, GitHub Actions `deploy-routing-tiles.yml` weekly): generates a custom roads+paths tileset from raw OSM (Geofabrik extracts → `osmium tags-filter` to highways → optional `osmium merge` → `tilemaker`) and writes `routing-manifest.json`. CI downloads + filters each distinct continent **once** (`tiles/prepare-source.sh`, the pipeline's `prepare` job) and fans the prefiltered roads out to every chunk that uses it, then a `cleanup` job deletes those scratch artifacts. These drive the **road graph** — see below.
+- **Routing tiles** (`./tiles/build-routing.sh`, GitHub Actions `deploy-routing-tiles.yml` monthly): generates a custom roads+paths tileset from raw OSM (Geofabrik extracts → `osmium tags-filter` to highways → optional `osmium merge` → `tilemaker`) and writes `routing-manifest.json`. CI downloads + filters each distinct continent **once** (`tiles/prepare-source.sh`, the pipeline's `prepare` job) and fans the prefiltered roads out to every chunk that uses it, then a `cleanup` job deletes those scratch artifacts. These drive the **road graph** — see below.
 
 Both tile pipelines share the same three-job shape (resolve metadata → sharded per-region build → assemble manifest) via the reusable `.github/workflows/tiles-pipeline.yml`, and the same shell scaffolding via `tiles/lib.sh`; `deploy-tiles.yml`/`deploy-routing-tiles.yml` are thin callers that pass their differences (source, tooling, schema, manifest name) as inputs.
 
@@ -118,7 +118,7 @@ Regions are defined in `tiles/regions.json` (id, name, ownership bbox per region
 
 Crossing into another region requires a page refresh — `maxBounds` blocks panning out, and the "Re-center" button surfaces an out-of-region banner if geolocation lands the user elsewhere.
 
-The manifest URL is stable, so tile rebuilds (weekly) don't require an app redeploy — clients just pick up the new entries on next page load.
+The manifest URL is stable, so tile rebuilds (weekly display, monthly routing) don't require an app redeploy — clients just pick up the new entries on next page load.
 
 ### Routing tileset (graph source)
 

@@ -327,7 +327,17 @@ function stitch(
   // Grid cell ≈ ε. To merge across cell boundaries, look up 3×3 cells.
   // Cells are also segregated by `level` so bridge-interior vertices
   // don't get matched against street-interior vertices below.
-  const grid = new Map<string, number[]>(); // cellKey → canonical node ids
+  //
+  // Cell keys are packed numerically — string keys here cost a concat +
+  // hash per vertex, hundreds of thousands of times per build. Cell
+  // indices fit ±2^25 (|lng| / epsLng ≤ ~1.8e7 at ε = 1 m), so a (cx, cy)
+  // pair packs exactly into one double; `level` gets its own inner map
+  // since OSM layer values are unbounded.
+  const CELL_BIAS = 2 ** 25;
+  const CELL_SPAN = 2 ** 26;
+  const cellKey = (cx: number, cy: number): number =>
+    (cx + CELL_BIAS) * CELL_SPAN + (cy + CELL_BIAS);
+  const grid = new Map<number, Map<number, number[]>>(); // level → cellKey → node ids
   const exactKey = new Map<string, number>(); // "lng,lat,level" → id (no-merge mode)
   const nodes: GraphNode[] = [];
 
@@ -351,25 +361,30 @@ function stitch(
     }
     const cx = Math.floor(lng / epsLng);
     const cy = Math.floor(lat / epsLat);
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        const k = `${cx + dx},${cy + dy},${level}`;
-        const bucket = grid.get(k);
-        if (!bucket) continue;
-        for (const nodeId of bucket) {
-          const n = nodes[nodeId];
-          const dLngM = (n.lng - lng) / epsLng * EPS_M;
-          const dLatM = (n.lat - lat) / epsLat * EPS_M;
-          if (dLngM * dLngM + dLatM * dLatM <= eps2) return nodeId;
+    let lvlGrid = grid.get(level);
+    if (lvlGrid) {
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const bucket = lvlGrid.get(cellKey(cx + dx, cy + dy));
+          if (!bucket) continue;
+          for (const nodeId of bucket) {
+            const n = nodes[nodeId];
+            const dLngM = (n.lng - lng) / epsLng * EPS_M;
+            const dLatM = (n.lat - lat) / epsLat * EPS_M;
+            if (dLngM * dLngM + dLatM * dLatM <= eps2) return nodeId;
+          }
         }
       }
+    } else {
+      lvlGrid = new Map();
+      grid.set(level, lvlGrid);
     }
     const id = nodes.length;
     nodes.push({ id, lng, lat });
-    const k = `${cx},${cy},${level}`;
-    const bucket = grid.get(k);
+    const k = cellKey(cx, cy);
+    const bucket = lvlGrid.get(k);
     if (bucket) bucket.push(id);
-    else grid.set(k, [id]);
+    else lvlGrid.set(k, [id]);
     return id;
   };
 
@@ -430,7 +445,9 @@ function stitch(
   const cosLat = Math.cos((refLat * Math.PI) / 180);
 
   interface SubRef { s: number; i: number; }
-  const subGrid = new Map<string, SubRef[]>();
+  // Same packed numeric key as the ε grid (sub-cells are coarser, so the
+  // indices are comfortably inside the bias range).
+  const subGrid = new Map<number, SubRef[]>();
   for (let s = 0; s < segments.length; s++) {
     const seg = segments[s];
     if (seg.level !== 0) continue;
@@ -443,7 +460,7 @@ function stitch(
       const maxCy = Math.floor(Math.max(a[1], b[1]) / subCellLat);
       for (let cx = minCx; cx <= maxCx; cx++) {
         for (let cy = minCy; cy <= maxCy; cy++) {
-          const k = `${cx},${cy}`;
+          const k = cellKey(cx, cy);
           const arr = subGrid.get(k);
           if (arr) arr.push({ s, i });
           else subGrid.set(k, [{ s, i }]);
@@ -476,7 +493,7 @@ function stitch(
       let best: Insertion | null = null;
       for (let ddx = -1; ddx <= 1; ddx++) {
         for (let ddy = -1; ddy <= 1; ddy++) {
-          const arr = subGrid.get(`${cx + ddx},${cy + ddy}`);
+          const arr = subGrid.get(cellKey(cx + ddx, cy + ddy));
           if (!arr) continue;
           for (const ref of arr) {
             if (ref.s === s) continue; // don't snap a segment onto itself

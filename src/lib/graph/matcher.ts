@@ -414,9 +414,12 @@ export class Matcher {
     if (src.edgeId === dst.edgeId) {
       return slicePolyline(this.edgePoly[src.edgeId], src.proj.offset, dst.proj.offset);
     }
-    // Run Dijkstra from src's endpoints with predecessor tracking.
-    const pred = this.dijkstraWithPred(src);
+    // Run Dijkstra from src's endpoints with predecessor tracking. Viterbi
+    // only accepted transitions with route distance <= TRANSITION_CAP_M, so
+    // the reconstruction search can be bounded by the same ceiling instead
+    // of exploring the whole component.
     const dstNodes = [this.edgeA[dst.edgeId], this.edgeB[dst.edgeId]];
+    const pred = this.dijkstraWithPred(src, dstNodes, TRANSITION_CAP_M);
     let bestEnd = -1;
     let bestTotal = Infinity;
     for (const n of dstNodes) {
@@ -432,7 +435,8 @@ export class Matcher {
       }
     }
     if (bestEnd < 0) {
-      // Disconnected — fall back to straight line so we still render something.
+      // Disconnected (or past the cap, which Viterbi's acceptance rules out)
+      // — fall back to straight line so we still render something.
       return [src.proj.point, dst.proj.point];
     }
 
@@ -481,15 +485,22 @@ export class Matcher {
 
   /**
    * Dijkstra from src candidate's endpoints with predecessor + cost
-   * tracking. Unbounded (caller has already chosen this is the right
-   * pair, so we let it run to find a path).
+   * tracking. Bounded by `maxCost`, and terminates as soon as every node
+   * in `targets` is settled — the caller only ever reads the targets'
+   * chains, so the rest of the frontier is wasted work.
    */
-  private dijkstraWithPred(src: Candidate): Map<number, { from: number | null; cost: number }> {
+  private dijkstraWithPred(
+    src: Candidate,
+    targets: number[],
+    maxCost: number,
+  ): Map<number, { from: number | null; cost: number }> {
     const result = new Map<number, { from: number | null; cost: number }>();
     const heap = new MinHeap<number>();
     const len = this.edgeLen[src.edgeId];
+    const unsettled = new Set(targets);
 
     const seed = (nodeId: number, cost: number) => {
+      if (cost > maxCost) return;
       const ex = result.get(nodeId);
       if (ex && ex.cost <= cost) return;
       result.set(nodeId, { from: null, cost });
@@ -504,9 +515,11 @@ export class Matcher {
       const du = top.p;
       const cur = result.get(u);
       if (!cur || du > cur.cost) continue;
+      if (unsettled.delete(u) && unsettled.size === 0) break;
       for (const eId of this.adj[u]) {
         const v = this.edgeA[eId] === u ? this.edgeB[eId] : this.edgeA[eId];
         const nd = du + this.edgeLen[eId];
+        if (nd > maxCost) continue;
         const ex = result.get(v);
         if (!ex || nd < ex.cost) {
           result.set(v, { from: u, cost: nd });

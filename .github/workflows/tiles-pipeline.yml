@@ -70,6 +70,10 @@ on:
         description: Per-region build job timeout (minutes)
         default: 30
         type: number
+      build_max_parallel:
+        description: Max concurrent build shards (cap when shards share a throttled upstream)
+        default: 4
+        type: number
       download_threads:
         description: Parallel range-request threads for pmtiles extract (display only)
         default: '4'
@@ -200,11 +204,12 @@ jobs:
     timeout-minutes: ${{ inputs.build_timeout }}
     strategy:
       fail-fast: false
-      # Cap shards reading the same upstream at once: the display pipeline range-
-      # reads one Protomaps daily object (its origin throttles aggregate
-      # throughput); the routing pipeline pulls from the Geofabrik mirror. 4
-      # keeps each shard near standalone speed while finishing in ~two waves.
-      max-parallel: 4
+      # Caller-tuned: the display pipeline range-reads one Protomaps daily
+      # object whose origin throttles aggregate throughput, so it keeps the
+      # default of 4; routing shards read only run artifacts + prepared pbfs
+      # (Geofabrik is hit by `prepare`, not here), so that caller raises it to
+      # run every region at once.
+      max-parallel: ${{ inputs.build_max_parallel }}
       matrix:
         region: ${{ fromJson(needs.setup.outputs.regions) }}
     steps:

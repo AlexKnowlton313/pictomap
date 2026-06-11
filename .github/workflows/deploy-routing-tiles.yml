@@ -50,6 +50,10 @@ jobs:
       # Continent download + tilemaker can take well over an hour for the dense
       # regions; generous cap so a slow region completes.
       build_timeout: 180
+      # Build shards read prepared artifacts, not Geofabrik (prepare does the
+      # polite downloading at its own max-parallel: 4), so run all regions at
+      # once instead of the display pipeline's throttled waves.
+      build_max_parallel: 11
       free_aggressive: true
       # Continent builds run past the default 1h OIDC session; request one that
       # outlives the 180m timeout (role MaxSessionDuration must allow it).

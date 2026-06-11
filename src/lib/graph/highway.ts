@@ -66,6 +66,17 @@ export function classifyRoad(
     return 'unbuilt';
   }
 
+  // Sidewalks and street crossings are separate OSM geometries running a
+  // few meters off the road centerline. With both at zero penalty the
+  // matcher hops road↔sidewalk freely to shave emission cost; demoting
+  // them makes the centerline win wherever the road itself is runnable.
+  // Only the routing tileset emits `footway` — on the display-tile
+  // fallback these stay `path` (old behavior).
+  const footway = String(props.footway ?? '');
+  if (footway === 'sidewalk' || footway === 'crossing' || footway === 'traffic_island') {
+    return 'sidewalk';
+  }
+
   switch (detail) {
     case 'motorway':
     case 'motorway_link':
@@ -131,4 +142,4 @@ export function isRunnable(klass: RoadClass): boolean {
  * in a way that would make older cached entries wrong. The tile cache
  * includes this in its key, so a bump invalidates stale entries.
  */
-export const CLASSIFIER_VERSION = 5;
+export const CLASSIFIER_VERSION = 6;

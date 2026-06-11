@@ -187,6 +187,7 @@
           'minor', '#ffd24d',
           'residential', '#9fe870',
           'path', '#4ad6ff',
+          'sidewalk', '#5e8ca0',
           'service', '#a78bfa',
           /* other */ '#cbd5e1',
         ],

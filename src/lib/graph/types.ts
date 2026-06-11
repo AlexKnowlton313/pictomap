@@ -13,6 +13,7 @@ export type RoadClass =
   | 'minor'       // secondary/tertiary — neutral
   | 'residential' // preferred
   | 'path'        // footway/cycleway — preferred
+  | 'sidewalk'    // footway=sidewalk/crossing — demoted so the road centerline wins
   | 'service'     // alleys/driveways — neutral
   | 'other';      // catch-all — small penalty
 

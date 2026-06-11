@@ -40,6 +40,8 @@ const TRANSITION_CAP_M = 1500;
 const TRANSITION_CAP_MULTIPLIER = 5;
 /** Minimum per-transition cap, regardless of how short the input step is. */
 const TRANSITION_CAP_FLOOR_M = 400;
+/** Out-and-back spurs shorter than this (one-way meters) are excised. */
+const SPUR_MAX_M = 120;
 
 const RUNNABILITY_PENALTY: Record<RoadClass, number> = {
   // rail / unbuilt are hard-blocked at graph build time and should
@@ -55,6 +57,12 @@ const RUNNABILITY_PENALTY: Record<RoadClass, number> = {
   minor: 0.15,
   residential: 0,
   path: 0,
+  // Sidewalks/crossings parallel a road centerline a few meters away —
+  // close enough that the emission Gaussian barely distinguishes them.
+  // This penalty makes hopping onto the sidewalk cost more than the few
+  // meters of emission it saves, but stays below motorway's 1.5 so the
+  // sidewalk still wins alongside roads that aren't runnable themselves.
+  sidewalk: 0.4,
   service: 0.1,
   other: 0.25,
 };
@@ -233,8 +241,10 @@ export class Matcher {
       );
     }
 
-    const route = this.stitchRoute(lattice, path);
+    const rawRoute = this.stitchRoute(lattice, path);
+    const route = removeSpurs(rawRoute, SPUR_MAX_M);
     const length = polylineLengthLocal(route);
+    const trimmed = polylineLengthLocal(rawRoute) - length;
     const closeGap = Math.hypot(
       route[0][0] - route[route.length - 1][0],
       route[0][1] - route[route.length - 1][1],
@@ -243,7 +253,7 @@ export class Matcher {
     const matchMs = Math.round(performance.now() - t0);
     console.log(
       `[matcher] match ok: ${coords.length} verts, ${Math.round(length)}m, ${matchMs}ms ` +
-      `(${path.length}/${pts.length} pts kept)`,
+      `(${path.length}/${pts.length} pts kept, ${Math.round(trimmed)}m of spurs trimmed)`,
     );
     return { coords, length, closeGap, matchMs };
   }
@@ -642,6 +652,51 @@ export class Matcher {
     }
     return -1;
   }
+}
+
+/**
+ * Excise short out-and-back spurs: subpaths that leave the route at a
+ * vertex, run out to a tip, and retrace the same geometry back. These
+ * arise when a contour vertex sits closer to a side street than to the
+ * through-road — the emission term buys a detour that the shape term
+ * can't see, because the net bearing across the spur is unchanged. Spurs
+ * longer than `maxSpurM` (one-way) are kept: at route scale those are
+ * deliberate spikes in the drawn shape, not matcher artifacts.
+ *
+ * Retraced geometry is vertex-identical (both directions slice the same
+ * edge polylines), so a spur tip shows up as pts[i-1] ≈ pts[i+1]; the
+ * retraced range is grown symmetrically from the tip and cut out in one
+ * piece, leaving the branch-point vertex behind.
+ */
+function removeSpurs(route: V2[], maxSpurM: number): V2[] {
+  const same = (a: V2, b: V2): boolean => {
+    const dx = a[0] - b[0];
+    const dy = a[1] - b[1];
+    return dx * dx + dy * dy < 1e-4; // 1cm — slices share exact vertices
+  };
+  // Drop zero-length steps so tip detection sees clean geometry.
+  let pts = route.filter((p, i) => i === 0 || !same(p, route[i - 1]));
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 1; i < pts.length - 1; i++) {
+      if (!same(pts[i - 1], pts[i + 1])) continue;
+      // U-turn tip at i — grow k while the walk stays retraced.
+      let k = 1;
+      while (i - k - 1 >= 0 && i + k + 1 < pts.length && same(pts[i - k - 1], pts[i + k + 1])) k++;
+      let spurLen = 0;
+      for (let s = i - k; s < i; s++) {
+        spurLen += Math.hypot(pts[s + 1][0] - pts[s][0], pts[s + 1][1] - pts[s][1]);
+      }
+      if (spurLen > maxSpurM) continue;
+      // pts[i-k] and pts[i+k] are the same branch point; keep one copy.
+      pts = pts.slice(0, i - k + 1).concat(pts.slice(i + k + 1));
+      changed = true; // rescan — excision can expose a parent spur
+      break;
+    }
+  }
+  return pts;
 }
 
 function polylineLengthLocal(poly: V2[]): number {

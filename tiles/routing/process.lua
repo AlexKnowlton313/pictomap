@@ -60,6 +60,15 @@ function way_function()
   Attribute("kind", kind)
   Attribute("kind_detail", highway)
 
+  -- Sidewalks and street crossings are separate parallel geometries a few
+  -- meters off the road centerline; the matcher demotes them so routes
+  -- don't hop road↔sidewalk. Pass the tag through for the classifier
+  -- (src/lib/graph/highway.ts).
+  local footway = Find("footway")
+  if footway == "sidewalk" or footway == "crossing" or footway == "traffic_island" then
+    Attribute("footway", footway)
+  end
+
   local bridge = Find("bridge")
   if bridge ~= "" and bridge ~= "no" then Attribute("bridge", "yes") end
 

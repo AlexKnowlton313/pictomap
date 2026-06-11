@@ -15,7 +15,10 @@
 #      ROADS_DIR if present (CI prepares each distinct source ONCE and fans it
 #      out via artifacts; a standalone full run reuses across regions in TMP),
 #      else download + filter it on the fly via prepare-source.sh.
-#   2. osmium-merge them when there's more than one (cross-continent regions).
+#   2. osmium-merge them when there's more than one (cross-continent regions),
+#      then osmium-extract down to the region's extent bbox — tilemaker reads
+#      and node-indexes its *whole* input regardless of --bbox, so without the
+#      clip every chunk region would rescan its entire continent.
 #   3. tilemaker --bbox <extent>, using tiles/routing/{config.json,process.lua},
 #      -> a date-versioned PMTiles archive.
 #   4. Hard-fail if it exceeds CloudFront's 30GB per-object cap.
@@ -153,17 +156,28 @@ while IFS= read -r region; do
 
   # 2. Merge multi-source regions; otherwise feed the single roads pbf directly.
   #    Merging the small filtered files (not the full continents) is cheap.
-  #    tilemaker's --bbox does the spatial clipping, so no osmium extract step
-  #    is needed even when a region is only a sub-area of its source continent.
   MERGED=""
   if [ "${#ROADS[@]}" -gt 1 ]; then
     INPUT="${TMP_DIR}/${REGION_ID}-merged-roads.osm.pbf"
-    MERGED="$INPUT"   # ours to delete after tilemaker (prepared roads are not)
+    MERGED="$INPUT"   # ours to delete after the clip (prepared roads are not)
     echo "    osmium merge ${#ROADS[@]} prepared sources"
     osmium merge "${ROADS[@]}" -o "$INPUT" --overwrite
   else
     INPUT="${ROADS[0]}"
   fi
+
+  # 2.5 Clip to the region's extent bbox. tilemaker's --bbox only bounds the
+  #     *output* tiles — it still reads and node-indexes its whole input — so
+  #     chunk regions (na-*, eu-*) would otherwise rescan the entire continent.
+  #     osmium extract is one fast streaming pass over the roads-only file;
+  #     the default complete_ways strategy keeps boundary-crossing ways whole,
+  #     so seam tiles at the extent edge stay intact.
+  CLIPPED="${TMP_DIR}/${REGION_ID}-clipped-roads.osm.pbf"
+  echo "    osmium extract -> extent ${EXTENT_BBOX}"
+  osmium extract -b "$EXTENT_BBOX" "$INPUT" -o "$CLIPPED" --overwrite
+  [ -n "$MERGED" ] && rm -f "$MERGED"   # the clip supersedes the merge temp
+  INPUT="$CLIPPED"
+  echo "    -> clipped input ($(du -h "$CLIPPED" | cut -f1))"
 
   # 3. tilemaker -> PMTiles. --store keeps the node index on disk so large
   #    continents stay within the RAM budget. Chatty on stderr; run_logged
@@ -185,7 +199,7 @@ while IFS= read -r region; do
     exit 1
   fi
   rm -rf "$STORE_DIR"
-  [ -n "$MERGED" ] && rm -f "$MERGED"   # keep prepared roads; drop the merge temp
+  rm -f "$CLIPPED"   # keep prepared roads; drop the per-region clip temp
 
   SIZE_BYTES=$(file_size "$OUTPUT_PATH")
   echo "    -> ${OUTPUT_NAME} ($(du -h "$OUTPUT_PATH" | cut -f1))"
